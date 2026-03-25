@@ -1,0 +1,477 @@
+/*
+ * Copyright (2021) The Delta Lake Project Authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.delta
+
+import java.util.Date
+
+import org.apache.spark.sql.delta.DeltaTestUtils.modifyCommitTimestamp
+import org.apache.spark.sql.delta.actions.Protocol
+import org.apache.spark.sql.delta.coordinatedcommits.CatalogOwnedTableUtils
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.test.DeltaTestImplicits._
+
+import org.apache.spark.sql.{AnalysisException, DataFrame}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.LongType
+
+class DeltaCDCSQLSuite extends DeltaCDCSuiteBase with DeltaColumnMappingTestUtils {
+
+  /** Single method to do all kinds of CDC reads */
+  def cdcRead(
+    tblId: TblId,
+    start: Boundary,
+    end: Boundary,
+    schemaMode: Option[DeltaBatchCDFSchemaMode] = Some(BatchCDFSchemaLegacy),
+    // SQL API does not support generic reader options, so it's a noop here
+    readerOptions: Map[String, String] = Map.empty): DataFrame = {
+
+    // Set the batch CDF schema mode using SQL conf if we specified it
+    if (schemaMode.isDefined) {
+      var result: DataFrame = null
+      withSQLConf(DeltaSQLConf.DELTA_CDF_DEFAULT_SCHEMA_MODE_FOR_COLUMN_MAPPING_TABLE.key ->
+        schemaMode.get.name) {
+        result = cdcRead(tblId, start, end, None, readerOptions)
+      }
+      return result
+    }
+
+    val startPrefix: String = start match {
+      case startingVersion: StartingVersion =>
+        s"""${startingVersion.value}"""
+
+      case startingTimestamp: StartingTimestamp =>
+        s"""'${startingTimestamp.value}'"""
+
+      case Unbounded =>
+        ""
+    }
+    val endPrefix: String = end match {
+      case endingVersion: EndingVersion =>
+        s"""${endingVersion.value}"""
+
+      case endingTimestamp: EndingTimestamp =>
+        s"""'${endingTimestamp.value}'"""
+
+      case Unbounded =>
+        ""
+    }
+    val fnName = tblId match {
+      case _: TablePath =>
+        DeltaTableValueFunctions.CDC_PATH_BASED
+      case _: TableName =>
+        DeltaTableValueFunctions.CDC_NAME_BASED
+      case _ =>
+        throw new IllegalArgumentException("No table name or path provided")
+    }
+
+    if (endPrefix === "") {
+      sql(s"SELECT * FROM $fnName('${tblId.id}', $startPrefix)")
+    } else {
+      sql(s"SELECT * FROM $fnName('${tblId.id}', $startPrefix, $endPrefix) ")
+    }
+  }
+
+  override def ctas(
+      srcTbl: String,
+      dstTbl: String,
+      disableCDC: Boolean = false): Unit = {
+
+    val prefix = s"CREATE TABLE ${dstTbl} USING DELTA"
+    val suffix = s" AS SELECT * FROM table_changes('${srcTbl}', 0, 1)"
+
+    if (disableCDC) {
+      sql(prefix + s" TBLPROPERTIES (${DeltaConfigs.CHANGE_DATA_FEED.key} = false)" + suffix)
+    } else {
+      sql(prefix + suffix)
+    }
+  }
+
+  private def testNullRangeBoundary(start: Boundary, end: Boundary): Unit = {
+    test(s"range boundary cannot be null - start=$start end=$end") {
+      val tblName = "tbl"
+      withTable(tblName) {
+        createTblWithThreeVersions(tblName = Some(tblName))
+
+        checkError(intercept[DeltaIllegalArgumentException] {
+          cdcRead(new TableName(tblName), start, end)
+        }, "DELTA_CDC_READ_NULL_RANGE_BOUNDARY")
+      }
+    }
+  }
+
+  for (end <- Seq(
+    Unbounded,
+    EndingVersion("null"),
+    EndingVersion("0"),
+    EndingTimestamp(dateFormat.format(new Date(1)))
+  )) {
+    testNullRangeBoundary(StartingVersion("null"), end)
+  }
+
+  for (start <- Seq(StartingVersion("0"), StartingTimestamp(dateFormat.format(new Date(1))))) {
+    testNullRangeBoundary(start, EndingVersion("null"))
+  }
+
+  testNullRangeBoundary(StartingVersion("CAST(null AS INT)"), Unbounded)
+
+  test("select individual column should push down filters") {
+    val tblName = "tbl"
+    withTable(tblName) {
+      createTblWithThreeVersions(tblName = Some(tblName))
+
+      val plans = DeltaTestUtils.withAllPlansCaptured(spark) {
+        val res = sql(s"SELECT id, _change_type FROM table_changes('$tblName', 0, 1)")
+          .where(col("id") < lit(5))
+
+        assert(res.columns === Seq("id", "_change_type"))
+        checkAnswer(
+          res,
+          spark.range(5)
+            .withColumn("_change_type", lit("insert")))
+      }
+      assert(plans.map(_.executedPlan).toString
+        .contains("PushedFilters: [*IsNotNull(id), *LessThan(id,5)]"))
+    }
+  }
+
+  test("use cdc query as a subquery") {
+    val tblName = "tbl"
+    withTable(tblName) {
+      createTblWithThreeVersions(tblName = Some(tblName))
+
+      val res = sql(s"""
+          SELECT * FROM RANGE(30) WHERE id > (
+              SELECT count(*) FROM table_changes('$tblName', 0, 1))
+        """)
+      checkAnswer(
+        res,
+        spark.range(21, 30).toDF())
+    }
+  }
+
+  test("cdc table_changes is not case sensitive") {
+    val tblName = "tbl"
+    withTempDir { dir =>
+      withTable(tblName) {
+        createTblWithThreeVersions(tblName = Some(tblName))
+
+        checkAnswer(
+          spark.sql(s"SELECT * FROM tabLe_chAnges('$tblName', 0, 1)"),
+          spark.sql(s"SELECT * FROM taBle_cHanges('$tblName', 0, 1)")
+        )
+      }
+    }
+  }
+
+  test("cdc table_changes_by_path are not case sensitive") {
+    withTempDir { dir =>
+      createTblWithThreeVersions(path = Some(dir.getAbsolutePath))
+
+      checkAnswer(
+        spark.sql(s"SELECT * FROM tabLe_chaNges_By_pAth('${dir.getAbsolutePath}', 0, 1)"),
+        spark.sql(s"SELECT * FROM taBle_cHanges_bY_paTh('${dir.getAbsolutePath}', 0, 1)")
+      )
+    }
+  }
+
+
+  test("parse multi part table name") {
+    val tblName = "tbl"
+      withTable(tblName) {
+        createTblWithThreeVersions(tblName = Some(tblName))
+
+        checkAnswer(
+          spark.sql(s"SELECT * FROM table_changes('$tblName', 0, 1)"),
+          spark.sql(s"SELECT * FROM table_changes('default.`${tblName}`', 0, 1)")
+        )
+      }
+  }
+
+  test("negative case - invalid number of args") {
+    val tbl = "tbl"
+    withTable(tbl) {
+      spark.range(10).write.format("delta").saveAsTable(tbl)
+
+      val invalidQueries = Seq(
+        s"SELECT * FROM table_changes()",
+        s"SELECT * FROM table_changes('tbl', 1, 2, 3)",
+        s"SELECT * FROM table_changes('tbl')",
+        s"SELECT * FROM table_changes_by_path()",
+        s"SELECT * FROM table_changes_by_path('tbl', 1, 2, 3)",
+        s"SELECT * FROM table_changes_by_path('tbl')"
+      )
+      invalidQueries.foreach { q =>
+        val e = intercept[AnalysisException] {
+          sql(q)
+        }
+        assert(e.getMessage.contains("requires at least 2 arguments and at most 3 arguments"),
+          s"failed query: $q ")
+      }
+    }
+  }
+
+  test("negative case - invalid type of args") {
+    val tbl = "tbl"
+    withTable(tbl) {
+      spark.range(10).write.format("delta").saveAsTable(tbl)
+
+      val invalidQueries = Seq(
+        s"SELECT * FROM table_changes(1, 1)",
+        s"SELECT * FROM table_changes('$tbl', 1.0)",
+        s"SELECT * FROM table_changes_by_path(1, 1)",
+        s"SELECT * FROM table_changes_by_path('$tbl', 1.0)"
+      )
+
+      invalidQueries.foreach { q =>
+        val e = intercept[AnalysisException] {
+          sql(q)
+        }
+        assert(e.getMessage.contains("Unsupported expression type"), s"failed query: $q")
+      }
+    }
+  }
+
+  test("negative case - non-constant expressions in version/timestamp argument") {
+    val tbl = "tbl"
+    val otherTbl = "other_tbl"
+    withTempDir { dir =>
+      withTable(tbl, otherTbl) {
+        spark.range(10).write.format("delta").option("path", dir.getAbsolutePath).saveAsTable(tbl)
+        spark.range(5).toDF("version").write.format("delta").saveAsTable(otherTbl)
+
+        // (query, expectedFunctionName, expectedParamName, expectedPos, sqlExprPattern)
+        val testCases = Seq(
+          // Scalar subquery as starting arg
+          (s"SELECT * FROM table_changes('$tbl', (SELECT MAX(version) FROM $otherTbl))",
+            "table_changes", "starting", 2, "scalarsubquery.*"),
+          // Scalar subquery as ending arg
+          (s"SELECT * FROM table_changes('$tbl', 0, (SELECT MAX(version) FROM $otherTbl))",
+            "table_changes", "ending", 3, "scalarsubquery.*"),
+          // Scalar subquery in table_changes_by_path
+          (s"SELECT * FROM table_changes_by_path('${dir.getAbsolutePath}'," +
+            s" (SELECT MAX(version) FROM $otherTbl))",
+            "table_changes_by_path", "starting", 2, "scalarsubquery.*"),
+          // Aggregate expression as starting arg
+          (s"SELECT * FROM table_changes('$tbl', MAX(1))",
+            "table_changes", "starting", 2, ".*[Mm]ax.*"),
+          // Aggregate expression as ending arg
+          (s"SELECT * FROM table_changes('$tbl', 0, MAX(1))",
+            "table_changes", "ending", 3, ".*[Mm]ax.*"),
+          // Aggregate expression in table_changes_by_path
+          (s"SELECT * FROM table_changes_by_path('${dir.getAbsolutePath}', MAX(1))",
+            "table_changes_by_path", "starting", 2, ".*[Mm]ax.*")
+        )
+
+        testCases.foreach { case (q, expectedFn, expectedParam, expectedPos, sqlExprPattern) =>
+          checkErrorMatchPVals(
+            intercept[AnalysisException] { sql(q) },
+            "DELTA_CDC_NON_CONSTANT_ARGUMENT",
+            parameters = Map(
+              "argumentName" -> s"`$expectedParam`",
+              "pos" -> expectedPos.toString,
+              "functionName" -> s"`$expectedFn`",
+              "sqlExpr" -> sqlExprPattern
+            )
+          )
+        }
+      }
+    }
+  }
+
+  test("negative case - table_changes in correlated subquery with OuterReference") {
+    // When table_changes() is used inside a correlated subquery with an expression that
+    // wraps an OuterReference (e.g. `o.version + 0`), the top-level node is not Unevaluable
+    // (Add is evaluable) but its child OuterReference is. The old isInstanceOf[Unevaluable]
+    // check on the top-level expression misses this case and .eval() throws INTERNAL_ERROR.
+    // We instead catch that SparkException and re-throw as DELTA_CDC_NON_CONSTANT_ARGUMENT.
+    val tbl = "tbl"
+    val otherTbl = "other_tbl"
+    withTable(tbl, otherTbl) {
+      spark.range(10).write.format("delta").saveAsTable(tbl)
+      spark.range(5).toDF("version").write.format("delta").saveAsTable(otherTbl)
+
+      val q = s"""
+        SELECT * FROM $otherTbl o WHERE EXISTS (
+          SELECT 1 FROM table_changes('$tbl', o.version + 0)
+        )
+      """
+      checkErrorMatchPVals(
+        intercept[AnalysisException] { sql(q) },
+        "DELTA_CDC_NON_CONSTANT_ARGUMENT",
+        parameters = Map(
+          "argumentName" -> "`starting`",
+          "pos" -> "2",
+          "functionName" -> "`table_changes`",
+          "sqlExpr" -> ".*"
+        )
+      )
+    }
+  }
+
+  test("resolve expression for timestamp function") {
+    val tbl = "tbl"
+    withDefaultTimeZone(UTC) {
+      withTable(tbl) {
+        createTblWithThreeVersions(tblName = Some(tbl))
+
+        val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tbl))
+
+        val currentTime = new Date().getTime
+        modifyCommitTimestamp(deltaLog, 0, currentTime - 100000)
+        modifyCommitTimestamp(deltaLog, 1, currentTime)
+        modifyCommitTimestamp(deltaLog, 2, currentTime + 100000)
+
+        // Make sure the snapshot used for the `table_changes` query is updated with the
+        // new timestamps. The ICT changes in un-backfilled commits will not trigger the real
+        // snapshot update, so we need to manually clear the cache and refresh the snapshot
+        // to ensure the new timestamps are used.
+        DeltaLog.clearCache()
+
+        val readDf = sql(s"SELECT * FROM table_changes('$tbl', 0, now())")
+        checkCDCAnswer(
+          DeltaLog.forTable(spark, TableIdentifier("tbl")),
+          readDf,
+          spark.range(20)
+            .withColumn("_change_type", lit("insert"))
+            .withColumn("_commit_version", (col("id") / 10).cast(LongType))
+        )
+
+        // more complex expression
+        val readDf2 = sql(s"SELECT * FROM table_changes('$tbl', 0, now() + interval 5 seconds)")
+        checkCDCAnswer(
+          DeltaLog.forTable(spark, TableIdentifier("tbl")),
+          readDf2,
+          spark.range(20)
+            .withColumn("_change_type", lit("insert"))
+            .withColumn("_commit_version", (col("id") / 10).cast(LongType))
+        )
+
+        val readDf3 = sql("SELECT * FROM table_changes" +
+          s"('$tbl', string(date_sub(current_date(), 1)), string(now()))")
+        checkCDCAnswer(
+          DeltaLog.forTable(spark, TableIdentifier("tbl")),
+          readDf3,
+          spark.range(20)
+            .withColumn("_change_type", lit("insert"))
+            .withColumn("_commit_version", (col("id") / 10).cast(LongType))
+        )
+      }
+    }
+  }
+
+  test("resolve invalid table name should throw error") {
+    var e = intercept[AnalysisException] {
+      sql(s"SELECT * FROM table_changes(now(), 1, 1)")
+    }
+    assert(e.getMessage.contains("Unsupported expression type(TimestampType) for table name." +
+      " The supported types are [StringType literal]"))
+
+    e = intercept[AnalysisException] {
+      sql(s"SELECT * FROM table_changes('invalidtable', 1, 1)")
+    }
+    assert(e.getErrorClass === "TABLE_OR_VIEW_NOT_FOUND")
+
+    withTable ("tbl") {
+      spark.range(1).write.format("delta").saveAsTable("tbl")
+      val e = intercept[AnalysisException] {
+        sql(s"SELECT * FROM table_changes(concat('tb', 'l'), 1, 1)")
+      }
+      assert(e.getMessage.contains("Unsupported expression type(StringType) for table name." +
+        " The supported types are [StringType literal]"))
+    }
+  }
+
+  test("resolution of complex expression should throw an error") {
+    val tbl = "tbl"
+    withTable(tbl) {
+      spark.range(10).write.format("delta").saveAsTable(tbl)
+      checkError(
+        intercept[AnalysisException] {
+          sql(s"SELECT * FROM table_changes('$tbl', 0, id)")
+        },
+        "UNRESOLVED_COLUMN.WITHOUT_SUGGESTION",
+        parameters = Map("objectName" -> "`id`"),
+        queryContext = Array(ExpectedContext(
+          fragment = "id",
+          start = 38,
+          stop = 39)))
+    }
+  }
+
+  test("protocol version") {
+    if (catalogOwnedDefaultCreationEnabledInTests) {
+      cancel("This test is intended to test the protocol version of `ChangeDataFeedTableFeature`." +
+        "For CCv1.5 tables, the protocol version has different requirement and we already have " +
+        "the corresponding coverage in `CatalogOwnedEnablementSuite` and " +
+        "`CatalogOwnedPropertyEdgeSuite`.")
+    }
+    withTable("tbl") {
+      spark.range(10).write.format("delta").saveAsTable("tbl")
+      val log = DeltaLog.forTable(spark, TableIdentifier(tableName = "tbl"))
+      // We set CDC to be enabled by default, so this should automatically bump the writer protocol
+      // to the required version.
+      if (columnMappingEnabled) {
+        assert(log.update().protocol == Protocol(2, 7).withFeatures(Seq(
+          AppendOnlyTableFeature,
+          InvariantsTableFeature,
+          ChangeDataFeedTableFeature,
+          ColumnMappingTableFeature)))
+      } else {
+        assert(log.update().protocol == Protocol(1, 7).withFeatures(Seq(
+          AppendOnlyTableFeature,
+          InvariantsTableFeature,
+          ChangeDataFeedTableFeature)))
+      }
+    }
+  }
+
+  test("table_changes and table_changes_by_path with a non-delta table") {
+    withTempDir { dir =>
+      withTable("tbl") {
+        spark.range(10).write.format("parquet")
+          .option("path", dir.getAbsolutePath)
+          .saveAsTable("tbl")
+
+        var e = intercept[AnalysisException] {
+          spark.sql(s"SELECT * FROM table_changes('tbl', 0, 1)")
+        }
+        assert(e.getErrorClass == "DELTA_TABLE_ONLY_OPERATION")
+        assert(e.getMessage.contains("table_changes"))
+
+        e = intercept[AnalysisException] {
+          spark.sql(s"SELECT * FROM table_changes_by_path('${dir.getAbsolutePath}', 0, 1)")
+        }
+        assert(e.getErrorClass == "DELTA_MISSING_DELTA_TABLE")
+        assert(e.getMessage.contains("not a Delta table"))
+      }
+    }
+  }
+}
+
+class DeltaCDCSQLWithCatalogOwnedBatch1Suite extends DeltaCDCSQLSuite {
+  override def catalogOwnedCoordinatorBackfillBatchSize: Option[Int] = Some(1)
+}
+
+class DeltaCDCSQLWithCatalogOwnedBatch2Suite extends DeltaCDCSQLSuite {
+  override def catalogOwnedCoordinatorBackfillBatchSize: Option[Int] = Some(2)
+}
+
+class DeltaCDCSQLWithCatalogOwnedBatch100Suite extends DeltaCDCSQLSuite {
+  override def catalogOwnedCoordinatorBackfillBatchSize: Option[Int] = Some(100)
+}

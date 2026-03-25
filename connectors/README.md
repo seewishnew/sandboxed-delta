@@ -1,0 +1,1 @@
+Connectors projects are no longer maintained in the `master` branch and new releases due to migration to the Delta Kernel project. Projects will continue to be supported in maintanence mode from the `spark-3.5-support` branch.

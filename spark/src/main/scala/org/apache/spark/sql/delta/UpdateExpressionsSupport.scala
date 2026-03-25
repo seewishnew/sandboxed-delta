@@ -1,0 +1,871 @@
+/*
+ * Copyright (2021) The Delta Lake Project Authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.spark.sql.delta
+
+import org.apache.spark.sql.delta.metering.DeltaLogging
+import org.apache.spark.sql.delta.schema.SchemaUtils
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.util.AnalysisHelper
+
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
+import org.apache.spark.sql.catalyst.analysis.Resolver
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.TargetOnlyStructFieldBehavior
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+
+/**
+ * Trait with helper functions to generate expressions to update target columns, even if they are
+ * nested fields.
+ */
+trait UpdateExpressionsSupport extends SQLConfHelper with AnalysisHelper with DeltaLogging {
+
+  /**
+   * Specifies an operation that updates a target column with the given expression.
+   * The target column may or may not be a nested field and it is specified as a full quoted name
+   * or as a sequence of split into parts.
+   *
+   * @param targetColNameParts The name parts of the target column
+   * @param updateExpr The expression to update the column with
+   * @param targetOnlyStructFieldBehavior Determines the nullness of target-only struct fields.
+   *                                      Note: This parameter only takes effect when schema
+   *                                      evolution is enabled; otherwise it is ignored.
+   */
+  case class UpdateOperation(
+      targetColNameParts: Seq[String],
+      updateExpr: Expression,
+      targetOnlyStructFieldBehavior: TargetOnlyStructFieldBehavior.Value)
+
+  /**
+   * The following trait and classes define casting behaviors to use in `castIfNeeded()`.
+   * @param resolveStructsByName    Whether struct fields should be resolved by name or by position
+   *                                during struct cast.
+   * @param allowMissingStructField Whether missing struct fields are allowed in the data to cast.
+   *                                Only relevant when struct fields are resolved by name.
+   *                                When true, missing struct fields in the input are set to null.
+   *                                When false, an error is thrown.
+   *                                Note: this should be set to true for schema evolution to work as
+   *                                the target schema may typically contain new struct fields not
+   *                                present in the input.
+   */
+  sealed trait CastingBehavior {
+    val resolveStructsByName: Boolean
+    val allowMissingStructField: Boolean
+  }
+
+  case class CastByPosition() extends CastingBehavior {
+    val resolveStructsByName: Boolean = false
+    val allowMissingStructField: Boolean = false
+  }
+
+  case class CastByName(allowMissingStructField: Boolean) extends CastingBehavior {
+    val resolveStructsByName: Boolean = true
+  }
+
+  /*
+   * MERGE and UPDATE casting behavior is configurable using internal configs to allow reverting to
+   * legacy behavior. In particular:
+   * - 'resolveMergeUpdateStructsByName.enabled': defaults to resolution by name for struct fields,
+   *   can be disabled to revert to resolution by position.
+   * - 'updateAndMergeCastingFollowsAnsiEnabledFlag': defaults to following
+   *   'spark.sql.storeAssignmentPolicy' for the type of cast to use, can be enabled to revert to
+   *   following 'spark.sql.ansi.enabled'. See `cast()` below.
+   */
+  trait MergeOrUpdateCastingBehavior
+  object MergeOrUpdateCastingBehavior {
+    def apply(schemaEvolutionEnabled: Boolean): CastingBehavior =
+      if (conf.getConf(DeltaSQLConf.DELTA_RESOLVE_MERGE_UPDATE_STRUCTS_BY_NAME)) {
+        new CastByName(allowMissingStructField = schemaEvolutionEnabled)
+          with MergeOrUpdateCastingBehavior
+      } else {
+        new CastByPosition() with MergeOrUpdateCastingBehavior
+      }
+  }
+
+  /**
+   * Add a cast to the child expression if it differs from the specified data type. Note that
+   * structs here are cast by name, rather than the Spark SQL default of casting by position.
+   *
+   * @param fromExpression the expression to cast
+   * @param dataType The data type to cast to.
+   * @param castingBehavior Configures the casting behavior to use, see [[CastingBehavior]].
+   * @param columnName The name of the column written to. It is used for the error message.
+   * @param originalTargetExprOpt Optional expression representing the original target column before
+   *                              the update. It is only relevant in MERGE ... UPDATE * with schema
+   *                              evolution to preserve the original values of target-only struct
+   *                              fields. In other cases, it is None and the target-only fields will
+   *                              be overwritten with null.
+   */
+  protected def castIfNeeded(
+      fromExpression: Expression,
+      dataType: DataType,
+      castingBehavior: CastingBehavior,
+      columnName: String,
+      originalTargetExprOpt: Option[Expression] = None): Expression = {
+
+    fromExpression match {
+      // Need to deal with NullType here, as some types cannot be casted from NullType, e.g.,
+      // StructType.
+      case Literal(nul, NullType) => Literal(nul, dataType)
+      case otherExpr =>
+        (fromExpression.dataType, dataType) match {
+          case (ArrayType(fromEt: StructType, fromNullable),
+              to @ ArrayType(toEt: StructType, toNullable))
+              if !(DataTypeUtils.sameType(fromEt, toEt) && fromNullable == toNullable) =>
+            fromExpression match {
+              // If fromExpression is an array function returning an array, cast the
+              // underlying array first and then perform the function on the transformed array.
+              case ArrayUnion(leftExpression, rightExpression) =>
+                val castedLeft =
+                  castIfNeeded(leftExpression, dataType, castingBehavior, columnName)
+                val castedRight =
+                  castIfNeeded(rightExpression, dataType, castingBehavior, columnName)
+                ArrayUnion(castedLeft, castedRight)
+
+              case ArrayIntersect(leftExpression, rightExpression) =>
+                val castedLeft =
+                  castIfNeeded(leftExpression, dataType, castingBehavior, columnName)
+                val castedRight =
+                  castIfNeeded(rightExpression, dataType, castingBehavior, columnName)
+                ArrayIntersect(castedLeft, castedRight)
+
+              case ArrayExcept(leftExpression, rightExpression) =>
+                val castedLeft =
+                  castIfNeeded(leftExpression, dataType, castingBehavior, columnName)
+                val castedRight =
+                  castIfNeeded(rightExpression, dataType, castingBehavior, columnName)
+                ArrayExcept(castedLeft, castedRight)
+
+              case ArrayRemove(leftExpression, rightExpression) =>
+                val castedLeft =
+                  castIfNeeded(leftExpression, dataType, castingBehavior, columnName)
+                // ArrayRemove removes all elements that equal to element from the given array.
+                // In this case, the element to be removed also needs to be casted into the target
+                // array's element type.
+                val castedRight =
+                  castIfNeeded(rightExpression, toEt, castingBehavior, columnName)
+                ArrayRemove(castedLeft, castedRight)
+
+              case ArrayDistinct(expression) =>
+                val castedExpr =
+                  castIfNeeded(expression, dataType, castingBehavior, columnName)
+                ArrayDistinct(castedExpr)
+
+              case _ =>
+                // generate a lambda function to cast each array item into to element struct type.
+                val structConverter: (Expression, Expression) => Expression = (_, i) =>
+                  castIfNeeded(
+                  GetArrayItem(fromExpression, i), toEt, castingBehavior, columnName)
+                val transformLambdaFunc = {
+                  val elementVar = NamedLambdaVariable("elementVar", toEt, toNullable)
+                  val indexVar = NamedLambdaVariable("indexVar", IntegerType, false)
+                  LambdaFunction(structConverter(elementVar, indexVar), Seq(elementVar, indexVar))
+                }
+                // Transforms every element in the array using the lambda function.
+                // Because castIfNeeded is called recursively for array elements, which
+                // generates nullable expression, ArrayTransform will generate an ArrayType with
+                // containsNull as true. Thus, the ArrayType to be casted to need to have
+                // containsNull as true to avoid casting failures.
+                cast(
+                  ArrayTransform(fromExpression, transformLambdaFunc),
+                  to.asNullable,
+                  castingBehavior,
+                  columnName
+                )
+            }
+          case (from: MapType, to: MapType) if !Cast.canCast(from, to) || (
+              // Structs can be nested into the MapType, so if we need to do by-name casts,
+              // we need to recurse into the children here.
+              castingBehavior.resolveStructsByName &&
+                containsNestedStruct(from) &&
+                containsNestedStruct(to) &&
+                !DataTypeUtils.equalsIgnoreCaseAndNullability(from, to)) =>
+            // Manually convert map keys and values if the types are not compatible to allow schema
+            // evolution. This is slower than direct cast so we only do it when required.
+            def createMapConverter(convert: (Expression, Expression) => Expression): Expression = {
+              val keyVar = NamedLambdaVariable("keyVar", from.keyType, nullable = false)
+              val valueVar =
+                NamedLambdaVariable("valueVar", from.valueType, from.valueContainsNull)
+              LambdaFunction(convert(keyVar, valueVar), Seq(keyVar, valueVar))
+            }
+
+            var transformedKeysAndValues = fromExpression
+            if (from.keyType != to.keyType) {
+              transformedKeysAndValues =
+                TransformKeys(transformedKeysAndValues, createMapConverter {
+                  (key, _) => castIfNeeded(key, to.keyType, castingBehavior, columnName)
+                })
+            }
+
+            if (from.valueType != to.valueType) {
+              transformedKeysAndValues =
+                TransformValues(transformedKeysAndValues, createMapConverter {
+                  (_, value) => castIfNeeded(value, to.valueType, castingBehavior, columnName)
+                })
+            }
+            cast(transformedKeysAndValues, to.asNullable, castingBehavior, columnName)
+          case (from: StructType, to: StructType)
+            if !DataTypeUtils.equalsIgnoreCaseAndNullability(from, to) &&
+              castingBehavior.resolveStructsByName =>
+            // All from fields must be present in the final schema, or we'll silently lose data.
+            if (from.exists { f => !to.exists(_.name.equalsIgnoreCase(f.name))}) {
+              throw DeltaErrors.updateSchemaMismatchExpression(from, to)
+            }
+
+            // In addition, if we don't allow missing struct fields, then the number of fields must
+            // necessarily match.
+            if (from.length != to.length && !castingBehavior.allowMissingStructField) {
+              throw DeltaErrors.updateSchemaMismatchExpression(from, to)
+            }
+
+            val originalTargetChildExprsOpt: Option[Map[String, Expression]] =
+              if (UpdateExpressionsSupport.isUpdateStarPreserveNullSourceStructsEnabled(conf)) {
+                extractOriginalTargetChildExprs(originalTargetExprOpt, to)
+              } else {
+                None
+              }
+
+            val nameMappedStruct = CreateNamedStruct(to.flatMap { field =>
+              val fieldNameLit = Literal(field.name)
+              // flatMap returns None if (1) originalTargetChildExprsOpt is None, or
+              // (2) originalTargetChildExprsOpt.get.get(field.name) is None, which happens when
+              // the field doesn't exist in the original target (newly added via schema evolution).
+              val targetFieldExprOpt: Option[Expression] =
+                originalTargetChildExprsOpt.flatMap(_.get(field.name))
+              val extractedField = from
+                .find { f => SchemaUtils.DELTA_COL_RESOLVER(f.name, field.name) }
+                .map { _ =>
+                  ExtractValue(fromExpression, fieldNameLit, SchemaUtils.DELTA_COL_RESOLVER)
+                }.getOrElse {
+                  // This shouldn't be possible - if all columns aren't present when missing struct
+                  // fields aren't allowed, we should have thrown an error earlier.
+                  if (!castingBehavior.allowMissingStructField) {
+                    throw DeltaErrors.extractReferencesFieldNotFound(s"$field",
+                      DeltaErrors.updateSchemaMismatchExpression(from, to))
+                  }
+                  // If the expression of the original target column is not provided or there is no
+                  // such field in the target column, fill the field with null.
+                  targetFieldExprOpt.getOrElse(Literal(null))
+                }
+              Seq(fieldNameLit,
+                castIfNeeded(
+                  extractedField,
+                  field.dataType,
+                  castingBehavior,
+                  field.name,
+                  targetFieldExprOpt))
+            })
+
+            // Fix for null expansion caused by struct type cast by preserving NULL source structs.
+            //
+            // Problem: When assigning a struct column, e.g., MERGE ... WHEN MATCHED THEN UPDATE SET
+            // t.col = s.col, if the source struct is NULL, the casting logic will expand the NULL
+            // into a non-null struct with all fields set to NULL:
+            //   NULL -> struct(field1: null, field2: null, ..., newField: null)
+            //
+            // Expected: The target struct should remain NULL when the source struct is NULL:
+            //   NULL -> NULL
+            //
+            // Solution: Wrap the named_struct expression in an IF expression that preserves NULL:
+            //   IF(source_struct IS NULL, NULL, named_struct(...))
+            //
+            // Additional behavior when originalTargetExpr is provided (MERGE ... UPDATE * with
+            // schema evolution):
+            // For target-only fields (fields in target but not in source), we need to preserve
+            // their original values from the target. The expression becomes:
+            //   IF(source_struct IS NULL AND target_struct IS NULL,
+            //      NULL,
+            //      named_struct(
+            //        source_fields...,
+            //        target_only_field1: original_target_value1,
+            //        target_only_field2: original_target_value2
+            //      ))
+            // This is to match the behavior of UPDATE * that target-only fields retain their
+            // values.
+            val wrappedWithNullPreservation =
+              maybeWrapWithNullPreservation(
+                sourceExpr = fromExpression,
+                sourceType = from,
+                targetType = to.asNullable,
+                targetNamedStructExpr = nameMappedStruct,
+                originalTargetExprOpt = originalTargetExprOpt)
+            cast(wrappedWithNullPreservation, to.asNullable, castingBehavior, columnName)
+
+          case (from, to) if from != to =>
+            cast(fromExpression, dataType, castingBehavior, columnName)
+          case _ => fromExpression
+        }
+    }
+  }
+
+  /**
+   * Extracts child expressions from the original target struct for fields that exist in both
+   * the original target and the evolved target schemas.
+   *
+   * This is used during MERGE UPDATE * with schema evolution to preserve target-only field values.
+   *
+   * @param originalTargetExprOpt The original target column expression (before schema evolution)
+   * @param evolvedTargetStruct The evolved target struct type (after schema evolution)
+   * @return A map from evolved field names that exist in the original target schema to extraction
+   *         expressions from the original target, or None if no original target expression is
+   *         provided.
+   */
+  private def extractOriginalTargetChildExprs(
+      originalTargetExprOpt: Option[Expression],
+      evolvedTargetStruct: StructType): Option[Map[String, Expression]] = {
+    originalTargetExprOpt.map { e =>
+      require(e.dataType.isInstanceOf[StructType],
+        s"originalTargetExprOpt dataType must be StructType but got ${e.dataType}")
+      val originalTargetStruct = e.dataType.asInstanceOf[StructType]
+      evolvedTargetStruct.flatMap { field =>
+        originalTargetStruct.find(f => SchemaUtils.DELTA_COL_RESOLVER(f.name, field.name))
+          .map { matchedField =>
+            // `field` is present in the target struct before schema evolution.
+            // Use matchedField.name to extract from the original target expression.
+            field.name -> ExtractValue(
+              e, Literal(matchedField.name), SchemaUtils.DELTA_COL_RESOLVER)
+          }
+      }.toMap
+    }
+  }
+
+  /**
+   * Conditionally wraps an expression with an IF expression to preserve NULL source values, when
+   * `DELTA_MERGE_PRESERVE_NULL_SOURCE_STRUCTS` is enabled:
+   *   IF(sourceExpr IS NULL, NULL, targetNamedStructExpr)
+   *
+   * When originalTargetExprOpt is defined (MERGE ... UPDATE * with schema evolution), the
+   * null condition is extended to check whether both the source and target struct are null:
+   *   IF(sourceExpr IS NULL AND targetExpr IS NULL, NULL, targetNamedStructExpr)
+   * This prevents data loss when the source is null but the target has non-null values in
+   * target-only fields.
+   * This is to match the behavior of UPDATE * that target-only fields retain their values.
+   *
+   * @param sourceExpr The expression of the source field
+   * @param sourceType The source struct type
+   * @param targetType The target struct type
+   * @param targetNamedStructExpr The generated target named struct expression
+   * @param originalTargetExprOpt The expression of the original target column. None when the
+   *                              fix is disabled or no original target expression is provided.
+   */
+  private def maybeWrapWithNullPreservation(
+      sourceExpr: Expression,
+      sourceType: StructType,
+      targetType: StructType,
+      targetNamedStructExpr: Expression,
+      originalTargetExprOpt: Option[Expression]): Expression = {
+    if (UpdateExpressionsSupport.isWholeStructAssignmentPreserveNullSourceStructsEnabled(conf)) {
+      val sourceNullCondition = IsNull(sourceExpr)
+      val targetHasExtraFieldsToPreserveValue =
+        UpdateExpressionsSupport.hasExtraStructFieldsToPreserveValue(sourceType, targetType)
+      val fullNullCondition = originalTargetExprOpt match {
+        case Some(originalTargetExpr) if targetHasExtraFieldsToPreserveValue =>
+          // When there are target-only fields to preserve, we need to check whether both the source
+          // and the original target are null.
+          And(sourceNullCondition, IsNull(originalTargetExpr))
+        case Some(_) if !targetHasExtraFieldsToPreserveValue =>
+          // No target-only fields to preserve values for.
+          sourceNullCondition
+        case None =>
+          // No original target expression provided, which means we overwrite the target with the
+          // source.
+          sourceNullCondition
+      }
+      If(
+        fullNullCondition,
+        Literal.create(null, targetType),
+        targetNamedStructExpr
+      )
+    } else {
+      targetNamedStructExpr
+    }
+  }
+
+  /**
+   * Given a target schema and a set of update operations, generate a list of update expressions,
+   * which are aligned with the given schema.
+   *
+   * For update operations to nested struct fields, this method recursively walks down schema tree
+   * and apply the update expressions along the way.
+   * For example, assume table `target` has the following schema:
+   *   s1 struct<a: int, b: int, c: int>, s2 struct<a: int, b: int>, z int
+   *
+   * Given an update command:
+   *
+   *  - UPDATE target SET s1.a = 1, s1.b = 2, z = 3
+   *
+   * this method works as follows:
+   *
+   * generateUpdateExpressions(
+   *   targetSchema=[s1,s2,z], defaultExprs=[s1,s2, z], updateOps=[(s1.a, 1), (s1.b, 2), (z, 3)])
+   *   -> generates expression for s1 - build recursively from child assignments
+   *   generateUpdateExpressions(
+   *     targetSchema=[a,b,c], defaultExprs=[a, b, c], updateOps=[(a, 1),(b, 2)], pathPrefix=["s1"])
+   *     end-of-recursion
+   *   -> returns (1, 2, a.c)
+   *   -> generates expression for s2 - no child assignment and no update expression: use
+   *      default expression `s2`
+   *   -> generates expression for z - use available update expression `3`
+   * -> returns ((1, 2, a.c), s2, 3)
+   *
+   * @param targetSchema schema to follow to generate update expressions. Due to schema evolution,
+   *                     it may contain additional columns or fields not present in the original
+   *                     table schema.
+   * @param updateOps a set of update operations.
+   * @param defaultExprs the expressions to use when no update operation is provided for a column
+   *                      or field. This is typically the output from the base table.
+   * @param pathPrefix the path from root to the current (nested) column. Only used for printing out
+   *                   full column path in error messages.
+   * @param allowSchemaEvolution Whether to allow generating expressions for new columns or fields
+   *                             added by schema evolution.
+   * @param generatedColumns the list of the generated columns in the table. When a column is a
+   *                         generated column and the user doesn't provide a update expression, its
+   *                         update expression in the return result will be None.
+   *                         If `generatedColumns` is empty, any of the options in the return result
+   *                         must be non-empty.
+   * @return a sequence of expression options. The elements in the sequence are options because
+   *         when a column is a generated column but the user doesn't provide an update expression
+   *         for this column, we need to generate the update expression according to the generated
+   *         column definition. But this method doesn't have enough context to do that. Hence, we
+   *         return a `None` for this case so that the caller knows it should generate the update
+   *         expression for such column. For other cases, we will always return Some(expr).
+   */
+  protected def generateUpdateExpressions(
+      targetSchema: StructType,
+      updateOps: Seq[UpdateOperation],
+      defaultExprs: Seq[NamedExpression],
+      resolver: Resolver,
+      pathPrefix: Seq[String] = Nil,
+      allowSchemaEvolution: Boolean = false,
+      generatedColumns: Seq[StructField] = Nil): Seq[Option[Expression]] = {
+    // Check that the head of nameParts in each update operation can match a target col. This avoids
+    // silently ignoring invalid column names specified in update operations.
+    updateOps.foreach { u =>
+      if (!targetSchema.exists(f => resolver(f.name, u.targetColNameParts.head))) {
+        throw DeltaErrors.updateSetColumnNotFoundException(
+          (pathPrefix :+ u.targetColNameParts.head).mkString("."),
+          targetSchema.map(f => (pathPrefix :+ f.name).mkString(".")))
+      }
+    }
+
+    // Transform each targetCol to a possibly updated expression
+    targetSchema.map { targetCol =>
+      // The prefix of a update path matches the current targetCol path.
+      val prefixMatchedOps =
+        updateOps.filter(u => resolver(u.targetColNameParts.head, targetCol.name))
+      val defaultExpr = defaultExprs.find(f => resolver(f.name, targetCol.name))
+      // No prefix matches this target column, return its original expression.
+      if (prefixMatchedOps.isEmpty) {
+        // Check whether it's a generated column or not. If so, we will return `None` so that the
+        // caller will generate an expression for this column. We cannot generate an expression at
+        // this moment because a generated column may use other columns which we don't know their
+        // update expressions yet.
+        if (generatedColumns.find(f => resolver(f.name, targetCol.name)).nonEmpty) {
+          None
+        } else if (defaultExpr.nonEmpty) {
+          if (conf.getConf(DeltaSQLConf.DELTA_MERGE_SCHEMA_EVOLUTION_FIX_NESTED_STRUCT_ALIGNMENT)) {
+            Some(castIfNeeded(
+              defaultExpr.get,
+              targetCol.dataType,
+              castingBehavior = MergeOrUpdateCastingBehavior(allowSchemaEvolution),
+              targetCol.name))
+          } else {
+            defaultExpr
+          }
+        } else {
+          // This is a new column or field added by schema evolution that doesn't have an assignment
+          // in this MERGE clause. Set it to null.
+
+          // Log an assertion for now (and fail in test) if schema evolution is disabled. We should
+          // turn this into an error in the future.
+          deltaAssert(allowSchemaEvolution,
+            name = "generateUpdateExpressions.allowSchemaEvolution",
+            msg = "Generating an expression for a new column or field but schema evolution is " +
+              "disabled."
+          )
+          Some(Literal(null))
+        }
+      } else {
+        // The update operation whose path exactly matches the current targetCol path.
+        val fullyMatchedOp = prefixMatchedOps.find(_.targetColNameParts.size == 1)
+        if (fullyMatchedOp.isDefined) {
+          // If a full match is found, then it should be the ONLY prefix match. Any other match
+          // would be a conflict, whether it is a full match or prefix-only. For example,
+          // when users are updating a nested column a.b, they can't simultaneously update a
+          // descendant of a.b, such as a.b.c.
+          if (prefixMatchedOps.size > 1) {
+            throw DeltaErrors.updateSetConflictException(
+              prefixMatchedOps.map(op => (pathPrefix ++ op.targetColNameParts).mkString(".")))
+          }
+          val preserveTargetOnlyFields =
+            UpdateExpressionsSupport.isUpdateStarPreserveNullSourceStructsEnabled(conf) &&
+            allowSchemaEvolution &&
+            fullyMatchedOp.get.targetOnlyStructFieldBehavior ==
+              TargetOnlyStructFieldBehavior.PRESERVE
+          val originalTargetExprOpt =
+            if (preserveTargetOnlyFields) {
+              // Expression corresponding to the original target column before the update.
+              defaultExpr
+            } else {
+              None
+            }
+          // For an exact match, return the updateExpr from the update operation.
+          Some(castIfNeeded(
+            fullyMatchedOp.get.updateExpr,
+            targetCol.dataType,
+            castingBehavior = MergeOrUpdateCastingBehavior(allowSchemaEvolution),
+            targetCol.name,
+            originalTargetExprOpt))
+        } else {
+          // So there are prefix-matched update operations, but none of them is a full match. Then
+          // that means targetCol is a complex data type, so we recursively pass along the update
+          // operations to its children.
+          targetCol.dataType match {
+            case childSchema: StructType =>
+              val defaultChildExprs = defaultExpr match {
+                case Some(expr @ NamedExpression(_, StructType(fields))) =>
+                  fields.zipWithIndex.map { case (field, ordinal) =>
+                    Alias(GetStructField(expr, ordinal, Some(field.name)), field.name)()
+                  }
+                case _ => Array.empty[NamedExpression]
+              }
+              // Recursively apply update operations to the children
+              val childTargetExprs = generateUpdateExpressions(
+                childSchema,
+                prefixMatchedOps.map(u => u.copy(targetColNameParts = u.targetColNameParts.tail)),
+                defaultChildExprs,
+                resolver,
+                pathPrefix :+ targetCol.name,
+                allowSchemaEvolution,
+                // Set `generatedColumns` to Nil because they are only valid in the top level.
+                generatedColumns = Nil)
+                .map(_.getOrElse {
+                  // Should not happen
+                  throw DeltaErrors.cannotGenerateUpdateExpressions()
+                })
+              // Reconstruct the expression for targetCol using its possibly updated children
+              val namedStructExprs = childSchema
+                .zip(childTargetExprs)
+                .flatMap { case (field, expr) => Seq(Literal(field.name), expr) }
+              Some(CreateNamedStruct(namedStructExprs))
+
+            case otherType =>
+              throw DeltaErrors.updateNonStructTypeFieldNotSupportedException(
+                (pathPrefix :+ targetCol.name).mkString("."), otherType)
+          }
+        }
+      }
+    }
+  }
+
+  /** See docs on overloaded method. */
+  protected def generateUpdateExpressions(
+      targetSchema: StructType,
+      defaultExprs: Seq[NamedExpression],
+      nameParts: Seq[Seq[String]],
+      updateExprs: Seq[Expression],
+      resolver: Resolver,
+      generatedColumns: Seq[StructField]): Seq[Option[Expression]] = {
+    assert(nameParts.size == updateExprs.size)
+    val updateOps = nameParts.zip(updateExprs).map {
+      case (nameParts, expr) =>
+        UpdateOperation(
+          targetColNameParts = nameParts,
+          updateExpr = expr,
+          // This method is called from regular UPDATE statements, where schema
+          // evolution is not allowed.
+          targetOnlyStructFieldBehavior = TargetOnlyStructFieldBehavior.TARGET_ALIGNED)
+    }
+    generateUpdateExpressions(
+      targetSchema = targetSchema,
+      updateOps = updateOps,
+      defaultExprs = defaultExprs,
+      resolver = resolver,
+      generatedColumns = generatedColumns
+    )
+  }
+
+  /**
+   * Generate update expressions for generated columns that the user doesn't provide a update
+   * expression. For each item in `updateExprs` that's None, we will find its generation expression
+   * from `generatedColumns`. In order to resolve this generation expression, we will create a
+   * fake Project which contains all update expressions and resolve the generation expression with
+   * this project. Source columns of a generation expression will also be replaced with their
+   * corresponding update expressions.
+   *
+   * For example, given a table that has a generated column `g` defined as `c1 + 10`. For the
+   * following update command:
+   *
+   * UPDATE target SET c1 = c2 + 100, c2 = 1000
+   *
+   * We will generate the update expression `(c2 + 100) + 10`` for column `g`. Note: in this update
+   * expression, we should use the old `c2` attribute rather than its new value 1000.
+   *
+   * @param updateTarget The logical plan of the table to be updated.
+   * @param generatedColumns A list of generated columns.
+   * @param updateExprs  The aligned (with `postEvolutionTargetSchema` if not None, or
+   *                     `updateTarget.output` otherwise) update actions.
+   * @param postEvolutionTargetSchema In case of UPDATE in MERGE when schema evolution happened,
+   *                                  this is the final schema of the target table. This might not
+   *                                  be the same as the output of `updateTarget`.
+   * @return a sequence of update expressions for all of columns in the table.
+   */
+  protected def generateUpdateExprsForGeneratedColumns(
+      updateTarget: LogicalPlan,
+      generatedColumns: Seq[StructField],
+      updateExprs: Seq[Option[Expression]],
+      postEvolutionTargetSchema: Option[StructType] = None): Seq[Expression] = {
+    val targetSchema = postEvolutionTargetSchema.getOrElse(updateTarget.schema)
+    assert(
+      targetSchema.size == updateExprs.length,
+      s"'generateUpdateExpressions' should return expressions that are aligned with the column " +
+        s"list. Expected size: ${targetSchema.size}, actual size: ${updateExprs.length}")
+    val schemaWithExprs = targetSchema.zip(updateExprs)
+    val exprsForProject = schemaWithExprs.flatMap {
+      case (field, Some(expr)) =>
+        // Create a named expression so that we can use it in Project
+        val exprForProject = Alias(expr, field.name)()
+        Some(exprForProject.exprId -> exprForProject)
+      case (_, None) => None
+    }.toMap
+    // Create a fake Project to resolve the generation expressions
+    val fakePlan = Project(exprsForProject.values.toArray[NamedExpression], updateTarget)
+    schemaWithExprs.map {
+      case (_, Some(expr)) => expr
+      case (targetCol, None) =>
+        // `targetCol` is a generated column and the user doesn't provide a update expression.
+        val resolvedExpr =
+          generatedColumns.find(f => conf.resolver(f.name, targetCol.name)) match {
+            case Some(field) =>
+              val expr = GeneratedColumn.getGenerationExpression(field).get
+              resolveReferencesForExpressions(SparkSession.active, expr :: Nil, fakePlan).head
+            case None =>
+              // Should not happen
+              throw DeltaErrors.nonGeneratedColumnMissingUpdateExpression(targetCol.name)
+          }
+        // As `resolvedExpr` will refer to attributes in `fakePlan`, we need to manually replace
+        // these attributes with their update expressions.
+        resolvedExpr.transform {
+          case a: AttributeReference if exprsForProject.contains(a.exprId) =>
+            exprsForProject(a.exprId).child
+        }
+    }
+  }
+
+  /**
+   * Replaces 'CastSupport.cast'. Selects a cast based on 'spark.sql.storeAssignmentPolicy'.
+   * Legacy behavior for UPDATE and MERGE followed 'spark.sql.ansi.enabled' instead, this legacy
+   * behavior can be re-enabled by setting
+   * 'spark.databricks.delta.updateAndMergeCastingFollowsAnsiEnabledFlag' to true.
+   */
+  private def cast(
+      child: Expression,
+      dataType: DataType,
+      castingBehavior: CastingBehavior,
+      columnName: String): Expression = {
+    if (castingBehavior.isInstanceOf[MergeOrUpdateCastingBehavior] &&
+      conf.getConf(DeltaSQLConf.UPDATE_AND_MERGE_CASTING_FOLLOWS_ANSI_ENABLED_FLAG)) {
+      return Cast(child, dataType, Option(conf.sessionLocalTimeZone))
+    }
+
+    conf.storeAssignmentPolicy match {
+      case SQLConf.StoreAssignmentPolicy.LEGACY =>
+        Cast(child, dataType, Some(conf.sessionLocalTimeZone), ansiEnabled = false)
+      case SQLConf.StoreAssignmentPolicy.ANSI =>
+        val cast = Cast(child, dataType, Some(conf.sessionLocalTimeZone), ansiEnabled = true)
+        if (canCauseCastOverflow(cast)) {
+          castingBehavior match {
+            case _: MergeOrUpdateCastingBehavior =>
+              CheckOverflowInTableWrite(cast, columnName)
+            case _ =>
+              cast.setTagValue(Cast.BY_TABLE_INSERTION, ())
+              CheckOverflowInTableInsert(cast, columnName)
+          }
+        } else {
+          cast
+        }
+      case SQLConf.StoreAssignmentPolicy.STRICT =>
+        UpCast(child, dataType)
+    }
+  }
+  private def containsNestedStruct(dt: DataType): Boolean = dt match {
+    case _: StructType => true
+    case _: AtomicType => false
+    case a: ArrayType => containsNestedStruct(a.elementType)
+    case m: MapType => containsNestedStruct(m.keyType) || containsNestedStruct(m.valueType)
+    // Let's defensively pretend it might have a nested struct if we don't recognise something.
+    case _ => true
+  }
+
+  private def containsIntegralOrDecimalType(dt: DataType): Boolean = dt match {
+    case _: IntegralType | _: DecimalType => true
+    case a: ArrayType => containsIntegralOrDecimalType(a.elementType)
+    case m: MapType =>
+      containsIntegralOrDecimalType(m.keyType) || containsIntegralOrDecimalType(m.valueType)
+    case s: StructType =>
+      s.fields.exists(sf => containsIntegralOrDecimalType(sf.dataType))
+    case _ => false
+  }
+
+  private def canCauseCastOverflow(cast: Cast): Boolean = {
+    containsIntegralOrDecimalType(cast.dataType) &&
+      !Cast.canUpCast(cast.child.dataType, cast.dataType)
+  }
+}
+
+case class CheckOverflowInTableWrite(child: Expression, columnName: String)
+  extends UnaryExpression {
+  override protected def withNewChildInternal(newChild: Expression): Expression = {
+    copy(child = newChild)
+  }
+
+  private def getCast: Option[Cast] = child match {
+    case c: Cast => Some(c)
+    case ExpressionProxy(c: Cast, _, _) => Some(c)
+    case _ => None
+  }
+
+  override def eval(input: InternalRow): Any = try {
+    child.eval(input)
+  } catch {
+    case e: ArithmeticException =>
+      getCast match {
+        case Some(cast) =>
+          throw DeltaErrors.castingCauseOverflowErrorInTableWrite(
+            cast.child.dataType,
+            cast.dataType,
+            columnName)
+        case None => throw e
+      }
+  }
+
+  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    getCast match {
+      case Some(child) => doGenCodeWithBetterErrorMsg(ctx, ev, child)
+      case None => child.genCode(ctx)
+    }
+  }
+
+  def doGenCodeWithBetterErrorMsg(ctx: CodegenContext, ev: ExprCode, child: Cast): ExprCode = {
+    val childGen = child.genCode(ctx)
+    val exceptionClass = classOf[ArithmeticException].getCanonicalName
+    assert(child.isInstanceOf[Cast])
+    val cast = child.asInstanceOf[Cast]
+    val fromDt =
+      ctx.addReferenceObj("from", cast.child.dataType, cast.child.dataType.getClass.getName)
+    val toDt = ctx.addReferenceObj("to", child.dataType, child.dataType.getClass.getName)
+    val col = ctx.addReferenceObj("colName", columnName, "java.lang.String")
+    // scalastyle:off line.size.limit
+    ev.copy(code =
+      code"""
+      boolean ${ev.isNull} = true;
+      ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+      try {
+        ${childGen.code}
+        ${ev.isNull} = ${childGen.isNull};
+        ${ev.value} = ${childGen.value};
+      } catch ($exceptionClass e) {
+        throw org.apache.spark.sql.delta.DeltaErrors
+          .castingCauseOverflowErrorInTableWrite($fromDt, $toDt, $col);
+      }"""
+    )
+    // scalastyle:on line.size.limit
+  }
+
+  override def dataType: DataType = child.dataType
+
+  override def sql: String = child.sql
+
+  override def toString: String = child.toString
+}
+
+object UpdateExpressionsSupport {
+
+  /**
+   * Returns true if preserving null source structs for whole-struct assignments is enabled.
+   * This fix addresses the issue where a null source struct is incorrectly expanded into
+   * a non-null struct with all fields set to null in whole-struct assignments, e.g.
+   * UPDATE SET col = s.col.
+   */
+  def isWholeStructAssignmentPreserveNullSourceStructsEnabled(conf: SQLConf): Boolean = {
+    conf.getConf(DeltaSQLConf.DELTA_MERGE_PRESERVE_NULL_SOURCE_STRUCTS)
+  }
+
+  /**
+   * Returns true if preserving null source structs for UPDATE * is enabled.
+   * This fix addresses the issue where a null source struct is incorrectly expanded into
+   * a non-null struct with all fields set to null in UPDATE * operations.
+   */
+  def isUpdateStarPreserveNullSourceStructsEnabled(conf: SQLConf): Boolean = {
+    isWholeStructAssignmentPreserveNullSourceStructsEnabled(conf) &&
+      conf.getConf(DeltaSQLConf.DELTA_MERGE_PRESERVE_NULL_SOURCE_STRUCTS_UPDATE_STAR)
+  }
+
+  /**
+   * Returns true if `targetType` contains extra struct fields compared to `sourceType` that we
+   * want to preserve values for.
+   *
+   * We recursively check target-only fields of structs nested within structs, but we do not
+   * check structs nested within arrays or maps because we don't preserve original target values
+   * for arrays or maps.
+   *
+   * Field name comparison is case-insensitive, aligning with
+   * `DataTypeUtils.equalsIgnoreCaseAndNullability`, which is used in
+   * `UpdateExpressionSupport.castIfNeeded` to decide whether struct type cast is needed.
+   *
+   * @param sourceStruct the source struct to compare against
+   * @param targetStruct the target struct to check for extra fields to preserve values for
+   * @return true if `targetStruct` has more struct fields than `sourceStruct` at any nesting level
+   *         that we want to preserve values for.
+   */
+  private def hasExtraStructFieldsToPreserveValue(
+      sourceStruct: StructType,
+      targetStruct: StructType): Boolean = {
+    // Fast check: if target has more fields, it definitely has extra fields than source.
+    if (targetStruct.length > sourceStruct.length) {
+      return true
+    }
+
+    // Partition target fields into target-only and common fields.
+    val (commonFields, targetOnlyFields) = targetStruct.partition { targetField =>
+      sourceStruct.exists(_.name.equalsIgnoreCase(targetField.name))
+    }
+
+    // If there are any target-only fields, we have extra fields to preserve.
+    if (targetOnlyFields.nonEmpty) {
+      return true
+    }
+
+    // No extra fields at this level - recursively check common fields that are `StructType`.
+    commonFields.exists { targetField =>
+      sourceStruct.find(_.name.equalsIgnoreCase(targetField.name)).exists { sourceField =>
+        (sourceField.dataType, targetField.dataType) match {
+          case (sourceStruct: StructType, targetStruct: StructType) =>
+            hasExtraStructFieldsToPreserveValue(sourceStruct, targetStruct)
+          case _ =>
+            // Don't recurse into arrays or maps, as we don't preserve values for arrays or maps.
+            false
+        }
+      }
+    }
+  }
+}

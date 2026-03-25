@@ -1,0 +1,2099 @@
+/*
+ * Copyright (2021) The Delta Lake Project Authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.delta.kernel.defaults
+
+import java.io.File
+import java.nio.file.Files
+import java.util.{Locale, Optional, UUID}
+
+import scala.collection.immutable.Seq
+import scala.jdk.CollectionConverters._
+
+import io.delta.golden.GoldenTableUtils.goldenTablePath
+import io.delta.kernel._
+import io.delta.kernel.Operation.{CREATE_TABLE, MANUAL_UPDATE, WRITE}
+import io.delta.kernel.data.{ColumnarBatch, ColumnVector, FilteredColumnarBatch, Row}
+import io.delta.kernel.defaults.internal.data.DefaultColumnarBatch
+import io.delta.kernel.defaults.internal.data.vector.DefaultGenericVector
+import io.delta.kernel.defaults.internal.data.vector.DefaultStructVector
+import io.delta.kernel.defaults.internal.parquet.ParquetSuiteBase
+import io.delta.kernel.defaults.utils.{AbstractWriteUtils, TestRow, WriteUtils}
+import io.delta.kernel.engine.Engine
+import io.delta.kernel.exceptions._
+import io.delta.kernel.expressions.{Column, Literal}
+import io.delta.kernel.expressions.Literal._
+import io.delta.kernel.internal.{ScanImpl, SnapshotImpl, TableConfig}
+import io.delta.kernel.internal.checkpoints.CheckpointerSuite.selectSingleElement
+import io.delta.kernel.internal.data.GenericRow
+import io.delta.kernel.internal.table.SnapshotBuilderImpl
+import io.delta.kernel.internal.types.DataTypeJsonSerDe
+import io.delta.kernel.internal.util.{Clock, JsonUtils}
+import io.delta.kernel.internal.util.SchemaUtils.casePreservingPartitionColNames
+import io.delta.kernel.internal.util.Utils.toCloseableIterator
+import io.delta.kernel.shaded.com.fasterxml.jackson.databind.node.ObjectNode
+import io.delta.kernel.transaction.DataLayoutSpec
+import io.delta.kernel.types._
+import io.delta.kernel.types.ByteType.BYTE
+import io.delta.kernel.types.DateType.DATE
+import io.delta.kernel.types.DecimalType
+import io.delta.kernel.types.DoubleType.DOUBLE
+import io.delta.kernel.types.FloatType.FLOAT
+import io.delta.kernel.types.IntegerType.INTEGER
+import io.delta.kernel.types.LongType.LONG
+import io.delta.kernel.types.ShortType.SHORT
+import io.delta.kernel.types.StringType.STRING
+import io.delta.kernel.types.StructType
+import io.delta.kernel.types.TimestampType.TIMESTAMP
+import io.delta.kernel.utils.CloseableIterable
+import io.delta.kernel.utils.CloseableIterable.{emptyIterable, inMemoryIterable}
+import io.delta.tables.DeltaTable
+
+import org.scalatest.funsuite.AnyFunSuite
+
+class DeltaTableWritesSuite extends AbstractDeltaTableWritesSuite with WriteUtils
+
+/** Transaction commit in this suite IS REQUIRED TO use commitTransaction than .commit */
+abstract class AbstractDeltaTableWritesSuite extends AnyFunSuite with AbstractWriteUtils
+    with ParquetSuiteBase {
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Create table tests
+  ///////////////////////////////////////////////////////////////////////////
+
+  test("create table - provide no schema - expect failure") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txnBuilder = table.createTransactionBuilder(engine, testEngineInfo, CREATE_TABLE)
+
+      val ex = intercept[TableNotFoundException] {
+        txnBuilder.build(engine)
+      }
+      assert(ex.getMessage.contains("Must provide a new schema to write to a new table"))
+    }
+  }
+
+  test("create table - provide partition columns but no schema - expect failure") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txnBuilder = table
+        .createTransactionBuilder(engine, testEngineInfo, CREATE_TABLE)
+        .withPartitionColumns(engine, Seq("part1", "part2").asJava)
+
+      val ex = intercept[TableNotFoundException] {
+        txnBuilder.build(engine)
+      }
+      assert(ex.getMessage.contains("Must provide a new schema to write to a new table"))
+    }
+  }
+
+  test("create table - table already exists at the location") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txn = getCreateTxn(engine, tablePath, testSchema)
+      commitTransaction(txn, engine, emptyIterable())
+
+      {
+        intercept[TableAlreadyExistsException] {
+          table.createTransactionBuilder(engine, testEngineInfo, CREATE_TABLE)
+            .build(engine)
+        }
+      }
+
+      // Provide schema
+      {
+        intercept[TableAlreadyExistsException] {
+          table.createTransactionBuilder(engine, testEngineInfo, CREATE_TABLE)
+            .withSchema(engine, testSchema)
+            .build(engine)
+        }
+      }
+
+      // Provide partition columns
+      {
+        intercept[TableAlreadyExistsException] {
+          table.createTransactionBuilder(engine, testEngineInfo, CREATE_TABLE)
+            .withSchema(engine, testPartitionSchema)
+            .withPartitionColumns(engine, testPartitionColumns.asJava)
+            .build(engine)
+        }
+      }
+    }
+  }
+
+  test("create table - table is concurrently created before txn commits") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txn1 = getCreateTxn(engine, tablePath, testSchema)
+
+      val txn2 = getCreateTxn(engine, tablePath, testSchema)
+      commitTransaction(txn2, engine, emptyIterable())
+
+      intercept[ConcurrentWriteException] {
+        commitTransaction(txn1, engine, emptyIterable())
+      }
+    }
+  }
+
+  test("cannot provide partition columns for existing table") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txn = getCreateTxn(engine, tablePath, testSchema)
+      commitTransaction(txn, engine, emptyIterable())
+
+      val ex = intercept[TableAlreadyExistsException] {
+        // Use operation != CREATE_TABLE since this fails earlier if the table already exists
+        table.createTransactionBuilder(engine, testEngineInfo, WRITE)
+          .withSchema(engine, testPartitionSchema)
+          .withPartitionColumns(engine, testPartitionColumns.asJava)
+          .build(engine)
+      }
+      assert(ex.getMessage.contains("Table already exists, but provided new partition columns." +
+        " Partition columns can only be set on a new table."))
+    }
+  }
+
+  test("create table with metadata columns in the schema - expect failure") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val schemaWithMetadataCol =
+        testSchema.addMetadataColumn("_metadata.row_index", MetadataColumnSpec.ROW_INDEX)
+
+      val ex = intercept[IllegalArgumentException] {
+        getCreateTxn(engine, tablePath, schemaWithMetadataCol)
+      }
+      assert(ex.getMessage.contains("Table schema cannot contain metadata columns"))
+    }
+  }
+
+  test("create un-partitioned table") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txn = getCreateTxn(engine, tablePath, testSchema)
+
+      assert(txn.getSchema(engine) === testSchema)
+      assert(txn.getPartitionColumns(engine) === Seq.empty.asJava)
+      assert(txn.getReadTableVersion == -1)
+      val txnResult = commitTransaction(txn, engine, emptyIterable())
+
+      assert(txnResult.getVersion === 0)
+      assertCheckpointReadiness(txnResult, isReadyForCheckpoint = false)
+
+      verifyCommitInfo(tablePath = tablePath, version = 0)
+      verifyWrittenContent(tablePath, testSchema, Seq.empty)
+    }
+  }
+
+  test("create table and set properties") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      val txn1 = getCreateTxn(engine, tablePath, testSchema)
+
+      commitTransaction(txn1, engine, emptyIterable())
+
+      val ver0Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver0Snapshot, TableConfig.CHECKPOINT_INTERVAL, 10)
+
+      setTablePropAndVerify(
+        engine = engine,
+        tablePath = tablePath,
+        isNewTable = false,
+        key = TableConfig.CHECKPOINT_INTERVAL,
+        value = "2",
+        expectedValue = 2)
+    }
+  }
+
+  test("create table with properties and they should be retained") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      setTablePropAndVerify(
+        engine = engine,
+        tablePath = tablePath,
+        key = TableConfig.CHECKPOINT_INTERVAL,
+        value = "2",
+        expectedValue = 2)
+
+      appendData(
+        engine,
+        tablePath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1))
+      val ver1Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver1Snapshot, TableConfig.CHECKPOINT_INTERVAL, 2)
+    }
+  }
+
+  test("create table and configure properties with retries") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      // Create table
+      val table = Table.forPath(engine, tablePath)
+      val txn0 = getCreateTxn(engine, tablePath, testSchema)
+      commitTransaction(txn0, engine, emptyIterable())
+
+      // Create txn1 with config changes
+      val txn1 = getUpdateTxn(
+        engine,
+        tablePath,
+        tableProperties = Map(TableConfig.CHECKPOINT_INTERVAL.getKey -> "2"))
+      // Create and commit txn2
+      appendData(
+        engine,
+        tablePath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1))
+
+      val ver1Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver1Snapshot, TableConfig.CHECKPOINT_INTERVAL, 10)
+
+      // Try to commit txn1
+      txn1.commit(engine, emptyIterable())
+
+      val ver2Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver2Snapshot, TableConfig.CHECKPOINT_INTERVAL, 2)
+    }
+  }
+
+  test("Setting retries to 0 disables retries") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      // Create table
+      val table = Table.forPath(engine, tablePath)
+      val txn0 = getCreateTxn(engine, tablePath, testSchema)
+      commitTransaction(txn0, engine, emptyIterable())
+
+      // Create txn1 with config changes
+      val txn1 = getUpdateTxn(
+        engine,
+        tablePath,
+        tableProperties = Map(TableConfig.CHECKPOINT_INTERVAL.getKey -> "2"),
+        maxRetries = 0)
+
+      // Create and commit txn2
+      appendData(
+        engine,
+        tablePath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1))
+
+      val ver1Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver1Snapshot, TableConfig.CHECKPOINT_INTERVAL, 10)
+
+      // Try to commit txn1 but expect failure
+      intercept[MaxCommitRetryLimitReachedException] {
+        txn1.commit(engine, emptyIterable())
+      }
+
+      // check that we're still set to 10
+      val ver2Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver2Snapshot, TableConfig.CHECKPOINT_INTERVAL, 10)
+    }
+  }
+
+  test("create table and configure the same properties") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+      setTablePropAndVerify(
+        engine = engine,
+        tablePath = tablePath,
+        key = TableConfig.CHECKPOINT_INTERVAL,
+        value = "2",
+        expectedValue = 2)
+      assert(getMetadataActionFromCommit(engine, table, 0).isDefined)
+
+      appendData(
+        engine,
+        tablePath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1),
+        tableProperties =
+          Map(TableConfig.CHECKPOINT_INTERVAL.getKey.toLowerCase(Locale.ROOT) -> "2"))
+      val ver1Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver1Snapshot, TableConfig.CHECKPOINT_INTERVAL, 2)
+      assert(getMetadataActionFromCommit(engine, table, 1).isEmpty)
+    }
+  }
+
+  test("create table and configure verifying that the case of the property is same as the one in" +
+    "TableConfig and not the one passed by the user.") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val table = Table.forPath(engine, tablePath)
+
+      appendData(
+        engine,
+        tablePath,
+        isNewTable = true,
+        testSchema,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1),
+        tableProperties =
+          Map(TableConfig.CHECKPOINT_INTERVAL.getKey.toLowerCase(Locale.ROOT) -> "2"))
+
+      val ver0Snapshot = table.getLatestSnapshot(engine).asInstanceOf[SnapshotImpl]
+      assertMetadataProp(ver0Snapshot, TableConfig.CHECKPOINT_INTERVAL, 2)
+
+      val configurations = ver0Snapshot.getMetadata.getConfiguration
+      assert(configurations.containsKey(TableConfig.CHECKPOINT_INTERVAL.getKey))
+      assert(
+        !configurations.containsKey(
+          TableConfig.CHECKPOINT_INTERVAL.getKey.toLowerCase(Locale.ROOT)))
+    }
+  }
+
+  test("create partitioned table - partition column is not part of the schema") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val ex = intercept[IllegalArgumentException] {
+        getCreateTxn(
+          engine,
+          tablePath,
+          schema = testPartitionSchema,
+          partCols = Seq("PART1", "part3"))
+      }
+      assert(ex.getMessage.contains("Partition column part3 not found in the schema"))
+    }
+  }
+
+  test("create partitioned table - partition column type is not supported") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val schema = new StructType()
+        .add("p1", new ArrayType(INTEGER, true))
+        .add("c1", DATE)
+        .add("c2", new DecimalType(14, 2))
+
+      val ex = intercept[KernelException] {
+        getCreateTxn(engine, tablePath, schema = schema, partCols = Seq("p1", "c1"))
+      }
+      assert(ex.getMessage.contains(
+        "Kernel doesn't support writing data with partition column (p1) of type: array[integer]"))
+    }
+  }
+
+  test("create a partitioned table") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val schema = new StructType()
+        .add("id", INTEGER)
+        .add("Part1", INTEGER) // partition column
+        .add("part2", INTEGER) // partition column
+
+      val txn = getCreateTxn(
+        engine,
+        tablePath,
+        schema = schema,
+        partCols = Seq("part1", "PART2"))
+
+      assert(txn.getSchema(engine) === schema)
+      // Expect the partition column name is exactly same as the one in the schema
+      assert(txn.getPartitionColumns(engine) === Seq("Part1", "part2").asJava)
+      val txnResult = commitTransaction(txn, engine, emptyIterable())
+
+      assert(txnResult.getVersion === 0)
+      assertCheckpointReadiness(txnResult, isReadyForCheckpoint = false)
+
+      verifyCommitInfo(tablePath, version = 0, Seq("Part1", "part2"))
+      verifyWrittenContent(tablePath, schema, Seq.empty)
+    }
+  }
+
+  Seq(true, false).foreach { includeTimestampNtz =>
+    test(s"create table with all supported types - timestamp_ntz included=$includeTimestampNtz") {
+      withTempDirAndEngine { (tablePath, engine) =>
+        val parquetAllTypes = goldenTablePath("parquet-all-types")
+        val goldenTableSchema = tableSchema(parquetAllTypes)
+        val schema = if (includeTimestampNtz) goldenTableSchema
+        else removeTimestampNtzTypeColumns(goldenTableSchema)
+
+        val txn = getCreateTxn(engine, tablePath, schema = schema)
+        val txnResult = commitTransaction(txn, engine, emptyIterable())
+
+        assert(txnResult.getVersion === 0)
+        assertCheckpointReadiness(txnResult, isReadyForCheckpoint = false)
+
+        verifyCommitInfo(tablePath, version = 0)
+        verifyWrittenContent(tablePath, schema, Seq.empty)
+      }
+    }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Collation write tests
+  ///////////////////////////////////////////////////////////////////////////
+
+  test("insert into table - simple collated string column") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val unicode = new StringType("ICU.UNICODE")
+      val serbianWithVersion = new StringType("ICU.SR_CYRL_SRB.75.1")
+      val serbianWithoutVersion = new StringType("ICU.SR_CYRL_SRB")
+
+      val commonSchema = new StructType()
+        .add("c1", IntegerType.INTEGER)
+        .add("c2", StringType.STRING)
+        .add("c3", STRING)
+        .add("c4", utf8Lcase)
+        .add("c5", unicode)
+      val schemaWithVersion = commonSchema.add("c6", serbianWithVersion)
+      val schemaWithoutVersion = commonSchema.add("c6", serbianWithoutVersion)
+
+      // First append
+      val data1 =
+        generateData(schemaWithVersion, Seq.empty, Map.empty, batchSize = 10, numBatches = 1)
+
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schemaWithVersion,
+        data = Seq(Map.empty[String, Literal] -> data1))
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+      // we use schemaWithoutVersion to verify since the version info is not stored in the
+      // schema serialization
+      verifyWrittenContent(tblPath, schemaWithoutVersion, data1.flatMap(_.toTestRows))
+
+      // Second append
+      val data2 =
+        generateData(schemaWithVersion, Seq.empty, Map.empty, batchSize = 5, numBatches = 1)
+
+      val commitResult1 = appendData(
+        engine,
+        tblPath,
+        data = Seq(Map.empty[String, Literal] -> data2))
+      verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+      verifyWrittenContent(
+        tblPath,
+        schemaWithoutVersion,
+        (data1 ++ data2).flatMap(_.toTestRows))
+
+      val metadata = getMetadata(engine, tblPath)
+      val parsed = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString())
+      assert(parsed === schemaWithoutVersion)
+    }
+  }
+
+  test("insert into table - collated string column with nulls") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val unicode = new StringType("ICU.UNICODE.74.1")
+      val schema = new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add("name", unicode)
+
+      val batchSize = 4
+      val idValues = Array[java.lang.Integer](1, 2, 3, 4).asInstanceOf[Array[AnyRef]]
+      val nameValues = Array[AnyRef]("Alice", null, "Bob", null)
+
+      val idVector = DefaultGenericVector.fromArray(IntegerType.INTEGER, idValues)
+      val nameVector = DefaultGenericVector.fromArray(unicode, nameValues)
+      val batch = new DefaultColumnarBatch(
+        batchSize,
+        schema,
+        Array[ColumnVector](idVector, nameVector))
+      val fcb = new FilteredColumnarBatch(batch, Optional.empty())
+
+      val commit = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schema,
+        data = Seq(Map.empty[String, Literal] -> Seq(fcb)))
+      verifyCommitResult(commit, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+
+      verifyWrittenContent(tblPath, schema, fcb.toTestRows)
+    }
+  }
+
+  test("insert into table - complex types with collated strings in nested/array/map") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val unicode = new StringType("ICU.UNICODE")
+      val unicodeWithVersion = new StringType("ICU.UNICODE.74")
+
+      val commonNested = new StructType()
+        .add("s1", utf8Lcase)
+        .add("n", INTEGER)
+
+      val nestedWithVersion = commonNested.add("s2", unicodeWithVersion)
+      val nestedWithoutVersion = commonNested.add("s2", unicode)
+
+      val schemaWithVersion = new StructType()
+        .add("nested", nestedWithVersion)
+        .add("arr", new ArrayType(utf8Lcase, true))
+        .add("map", new MapType(STRING, unicode, true))
+      val schemaWithoutVersion = new StructType()
+        .add("nested", nestedWithoutVersion)
+        .add("arr", new ArrayType(utf8Lcase, true))
+        .add("map", new MapType(STRING, unicode, true))
+
+      val batchSize = 4
+
+      def buildBatch(seed: String): FilteredColumnarBatch = {
+        val nestedVectors = Array[ColumnVector](
+          testColumnVector(batchSize, utf8Lcase),
+          testColumnVector(batchSize, INTEGER),
+          testColumnVector(batchSize, unicode))
+        val nestedVector = new DefaultStructVector(
+          batchSize,
+          nestedWithVersion,
+          Optional.empty(),
+          nestedVectors)
+
+        val arrValues: Seq[Seq[AnyRef]] = (0 until batchSize).map { i =>
+          Seq(s"${seed}t$i", s"${seed}x$i").map(_.asInstanceOf[AnyRef])
+        }
+        val arrVector = buildArrayVector(arrValues, utf8Lcase, containsNull = true)
+
+        val mapType = new MapType(STRING, unicode, true)
+        val mapValues: Seq[Map[AnyRef, AnyRef]] = (0 until batchSize).map { i =>
+          Map[AnyRef, AnyRef](s"${seed}k$i" -> s"${seed}v$i")
+        }
+        val mapVector = buildMapVector(mapValues, mapType)
+
+        val vectors = Array[ColumnVector](nestedVector, arrVector, mapVector)
+        val batch = new DefaultColumnarBatch(batchSize, schemaWithVersion, vectors)
+        new FilteredColumnarBatch(batch, Optional.empty())
+      }
+
+      val fcb1 = buildBatch("a-")
+      val fcb2 = buildBatch("b-")
+
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schemaWithVersion,
+        data = Seq(Map.empty[String, Literal] -> Seq(fcb1)))
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+
+      val commitResult1 = appendData(
+        engine,
+        tblPath,
+        data = Seq(Map.empty[String, Literal] -> Seq(fcb2)))
+
+      verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+
+      val expectedRows = Seq(fcb1, fcb2).flatMap(_.toTestRows)
+      verifyWrittenContent(tblPath, schemaWithVersion, expectedRows)
+
+      val metadata = getMetadata(engine, tblPath)
+      val parsed = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString())
+      assert(parsed === schemaWithoutVersion)
+    }
+  }
+
+  test("insert into table - nested struct with collated string field") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val unicode = new StringType("ICU.UNICODE")
+      val nested = new StructType()
+        .add("c21", utf8Lcase)
+        .add("c22", IntegerType.INTEGER)
+        .add("c23", unicode)
+        .add("c24", STRING)
+      val schema = new StructType()
+        .add("c1", LongType.LONG)
+        .add("c2", nested)
+
+      val data = generateData(schema, Seq.empty, Map.empty, batchSize = 8, numBatches = 2)
+
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schema,
+        data = Seq(Map.empty[String, Literal] -> data))
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+      verifyWrittenContent(tblPath, schema, data.flatMap(_.toTestRows))
+
+      val metadata = getMetadata(engine, tblPath)
+      val parsed = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString())
+      assert(parsed === schema)
+    }
+  }
+
+  test("insert into table - complex types with collated strings in nested fields") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val unicode = new StringType("ICU.UNICODE")
+
+      val nested = new StructType()
+        .add("c1", unicode)
+        .add("c2", IntegerType.INTEGER)
+        .add("c3", STRING)
+
+      val schema = new StructType()
+        .add("c1", IntegerType.INTEGER)
+        .add("c2", nested)
+        .add("c3", new ArrayType(utf8Lcase, true))
+        .add("c4", new MapType(STRING, unicode, true))
+
+      // Build vectors
+      val batchSize = 5
+      val c1Vector = testColumnVector(batchSize, IntegerType.INTEGER)
+
+      val nestedVectors = Array[ColumnVector](
+        testColumnVector(batchSize, unicode),
+        testColumnVector(batchSize, IntegerType.INTEGER),
+        testColumnVector(batchSize, STRING))
+      val c2Vector = new DefaultStructVector(batchSize, nested, Optional.empty(), nestedVectors)
+
+      val c3Values: Seq[Seq[AnyRef]] = (0 until batchSize).map { i =>
+        Seq(s"t$i", s"x$i").map(_.asInstanceOf[AnyRef])
+      }
+      val c3Vector = buildArrayVector(c3Values, utf8Lcase, containsNull = true)
+
+      val c4Type = new MapType(STRING, unicode, true)
+      val c4Values: Seq[Map[AnyRef, AnyRef]] = (0 until batchSize).map { i =>
+        Map[AnyRef, AnyRef](s"k$i" -> s"v$i")
+      }
+      val c4Vector = buildMapVector(c4Values, c4Type)
+
+      val vectors = Array[ColumnVector](c1Vector, c2Vector, c3Vector, c4Vector)
+      val batch = new DefaultColumnarBatch(batchSize, schema, vectors)
+      val fcb = new FilteredColumnarBatch(batch, Optional.empty())
+
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schema,
+        data = Seq(Map.empty[String, Literal] -> Seq(fcb)))
+
+      val metadata = getMetadata(engine, tblPath)
+      val parsed = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString)
+      assert(parsed === schema)
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+      val expectedRows = Seq(fcb).flatMap(_.toTestRows)
+      verifyWrittenContent(tblPath, schema, expectedRows)
+    }
+  }
+
+  test("insert into partitioned table - collated string partition columns") {
+    val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+    val unicode = new StringType("ICU.UNICODE.75.1")
+    val serbian = new StringType("ICU.SR_CYRL_SRB")
+    Seq(
+      // (p1BatchType, p2BatchType, vBatchType)
+      (utf8Lcase, unicode, serbian),
+      (serbian, serbian, utf8Lcase),
+      (utf8Lcase, serbian, unicode),
+      (unicode, serbian, STRING),
+      (STRING, serbian, STRING),
+      (STRING, STRING, STRING),
+      (utf8Lcase, STRING, utf8Lcase)).foreach { case (p1BatchType, p2BatchType, vBatchType) =>
+      withTempDirAndEngine { (tblPath, engine) =>
+        val schema = new StructType()
+          .add("id", INTEGER)
+          .add("p1", utf8Lcase) // partition column
+          .add("p2", unicode) // partition column
+          .add("v", serbian)
+
+        val schemaWithoutVersion = new StructType()
+          .add("id", INTEGER)
+          .add("p1", utf8Lcase)
+          .add("p2", new StringType("ICU.UNICODE"))
+          .add("v", serbian)
+
+        val dataSchema = new StructType()
+          .add("id", INTEGER)
+          .add("p1", p1BatchType)
+          .add("p2", p2BatchType)
+          .add("v", vBatchType)
+
+        val vCollation = vBatchType.getCollationIdentifier
+
+        val partCols = Seq("p1", "p2")
+
+        val v0Part = Map("p1" -> ofString("a"), "p2" -> ofString("alpha", vCollation))
+        val v0Data = generateData(dataSchema, partCols, v0Part, batchSize = 8, numBatches = 1)
+
+        val v1Part = Map("p1" -> ofString("B", vCollation), "p2" -> ofString("beta"))
+        val v1Data = generateData(dataSchema, partCols, v1Part, batchSize = 5, numBatches = 1)
+
+        val commitResult0 = appendData(
+          engine,
+          tblPath,
+          isNewTable = true,
+          schema,
+          partCols,
+          data = Seq(v0Part -> v0Data, v1Part -> v1Data))
+
+        verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+        // Expect partition columns in the same case as in the schema
+        verifyCommitInfo(tblPath, version = 0, partitionCols = partCols)
+
+        val expectedRows0 = v0Data.flatMap(_.toTestRows) ++ v1Data.flatMap(_.toTestRows)
+        verifyWrittenContent(tblPath, schema, expectedRows0)
+
+        val v2Part = Map("p1" -> ofString("c"), "p2" -> ofString("gamma"))
+        val v2Data = generateData(dataSchema, partCols, v2Part, batchSize = 4, numBatches = 3)
+
+        val commitResult1 = appendData(
+          engine,
+          tblPath,
+          data = Seq(v2Part -> v2Data))
+
+        verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+        // For subsequent commits, partitionBy is not recorded in commit info
+        verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+
+        val expectedRows1 = expectedRows0 ++ v2Data.flatMap(_.toTestRows)
+        verifyWrittenContent(tblPath, schema, expectedRows1)
+
+        val metadata = getMetadata(engine, tblPath)
+        val parsed = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString)
+        assert(parsed === schemaWithoutVersion)
+      }
+    }
+  }
+
+  test("stats: default engine writes binary stats for collated string columns") {
+    val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+    val unicode = new StringType("ICU.UNICODE")
+    val serbian = new StringType("ICU.SR_CYRL_SRB.74")
+    Seq(
+      (STRING, utf8Lcase, unicode),
+      (serbian, serbian, serbian),
+      (STRING, serbian, unicode),
+      (STRING, STRING, STRING)).foreach { case (c1DataType, c2DataType, c3DataType) =>
+      withTempDirAndEngine { (tblPath, engine) =>
+        val schema = new StructType()
+          .add("c1", STRING)
+          .add("c2", utf8Lcase)
+          .add("c3", unicode)
+
+        val txn = getCreateTxn(engine, tblPath, schema)
+        commitTransaction(txn, engine, emptyIterable())
+
+        val batchSize = 4
+        val values = Array("b", "A", "B", "a").map(_.asInstanceOf[AnyRef])
+        val c1 = DefaultGenericVector.fromArray(c1DataType, values)
+        val c2 = DefaultGenericVector.fromArray(c2DataType, values)
+        val c3 = DefaultGenericVector.fromArray(c3DataType, values)
+        val batch = new DefaultColumnarBatch(batchSize, schema, Array[ColumnVector](c1, c2, c3))
+        val fcb = new FilteredColumnarBatch(batch, Optional.empty())
+
+        val commit = appendData(engine, tblPath, data = Seq(Map.empty[String, Literal] -> Seq(fcb)))
+        verifyCommitResult(commit, expVersion = 1, expIsReadyForCheckpoint = false)
+
+        // Read stats JSON
+        val snapshot = Table.forPath(engine, tblPath).getLatestSnapshot(engine)
+        val scan = snapshot.getScanBuilder().build()
+        val scanFiles = scan.asInstanceOf[ScanImpl].getScanFiles(engine, true).toSeq
+          .flatMap(_.getRows.toSeq)
+        val statsJson = scanFiles.headOption.flatMap { row =>
+          val add = row.getStruct(row.getSchema.indexOf("add"))
+          val idx = add.getSchema.indexOf("stats")
+          if (idx >= 0 && !add.isNullAt(idx)) Some(add.getString(idx)) else None
+        }.getOrElse(fail("Stats JSON not found"))
+
+        // Default engine computes just non-collated stats; verify min/max values
+        val mapper = JsonUtils.mapper()
+        val statsNode = mapper.readTree(statsJson)
+        val minValues = statsNode.get("minValues")
+        val maxValues = statsNode.get("maxValues")
+
+        // All columns: [b, A, B, a] -> min "A", max "b"
+        assert(minValues.get("c1").asText() == "A")
+        assert(maxValues.get("c1").asText() == "b")
+
+        assert(minValues.get("c2").asText() == "A")
+        assert(maxValues.get("c2").asText() == "b")
+
+        assert(minValues.get("c3").asText() == "A")
+        assert(maxValues.get("c3").asText() == "b")
+      }
+    }
+  }
+
+  test("stats: collated non-partition column in partitioned table") {
+    val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+    val unicode = new StringType("ICU.UNICODE")
+    val serbian = new StringType("ICU.SR_CYRL_SRB.74")
+    Seq(
+      (utf8Lcase, unicode),
+      (serbian, serbian),
+      (utf8Lcase, serbian),
+      (STRING, STRING),
+      (STRING, utf8Lcase),
+      (unicode, STRING)).foreach { case (pBatchType, dBatchType) =>
+      withTempDirAndEngine { (tblPath, engine) =>
+        val schema = new StructType()
+          .add("p", utf8Lcase) // partition column
+          .add("c", serbian) // non-partition, collated
+
+        val dCollation = dBatchType.getCollationIdentifier
+
+        val txn = getCreateTxn(engine, tblPath, schema, partCols = Seq("p"))
+        commitTransaction(txn, engine, emptyIterable())
+
+        // Commit 1: p = "north", c values [b, A, B, a]
+        val batchSize1 = 4
+        val cValues1 = Array("b", "A", "B", "a").map(_.asInstanceOf[AnyRef])
+        val pValues1 = Array.fill[AnyRef](batchSize1)("north")
+        val pVec1 = DefaultGenericVector.fromArray(pBatchType, pValues1)
+        val cVec1 = DefaultGenericVector.fromArray(dBatchType, cValues1)
+        val batch1 = new DefaultColumnarBatch(batchSize1, schema, Array[ColumnVector](pVec1, cVec1))
+        val fcb1 = new FilteredColumnarBatch(batch1, Optional.empty())
+
+        val commit1 =
+          appendData(
+            engine,
+            tblPath,
+            data = Seq(Map("p" -> ofString("north", dCollation)) -> Seq(fcb1)))
+        verifyCommitResult(commit1, expVersion = 1, expIsReadyForCheckpoint = false)
+        verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+
+        // Commit 2: p = "south", c values [d, C]
+        val batchSize2 = 2
+        val cValues2 = Array("d", "C", "a").map(_.asInstanceOf[AnyRef])
+        val pValues2 = Array.fill[AnyRef](batchSize2)("south")
+        val pVec2 = DefaultGenericVector.fromArray(pBatchType, pValues2)
+        val cVec2 = DefaultGenericVector.fromArray(dBatchType, cValues2)
+        val batch2 = new DefaultColumnarBatch(batchSize2, schema, Array[ColumnVector](pVec2, cVec2))
+        val fcb2 = new FilteredColumnarBatch(batch2, Optional.empty())
+
+        val commit2 =
+          appendData(engine, tblPath, data = Seq(Map("p" -> ofString("south")) -> Seq(fcb2)))
+        verifyCommitResult(commit2, expVersion = 2, expIsReadyForCheckpoint = false)
+        verifyCommitInfo(tblPath, version = 2, partitionCols = null)
+
+        // Read stats JSON
+        val snapshot = Table.forPath(engine, tblPath).getLatestSnapshot(engine)
+        val scan = snapshot.getScanBuilder.build()
+        val scanFiles = scan.asInstanceOf[ScanImpl].getScanFiles(engine, true).toSeq
+          .flatMap(_.getRows.toSeq)
+
+        val mapper = JsonUtils.mapper()
+        assert(scanFiles.nonEmpty)
+        scanFiles.foreach { row =>
+          val add = row.getStruct(row.getSchema.indexOf("add"))
+          val path = add.getString(add.getSchema.indexOf("path"))
+          val statsIdx = add.getSchema.indexOf("stats")
+          assert(statsIdx >= 0 && !add.isNullAt(statsIdx))
+          val statsJson = add.getString(statsIdx)
+          val statsNode = mapper.readTree(statsJson)
+          val minValues = statsNode.get("minValues")
+          val maxValues = statsNode.get("maxValues")
+
+          val minC = minValues.get("c").asText()
+          val maxC = maxValues.get("c").asText()
+
+          if (path.contains("p=north")) {
+            // For [b, A, B, a] -> min "A", max "b"
+            assert(minC == "A")
+            assert(maxC == "b")
+          } else if (path.contains("p=south")) {
+            // For [d, C] -> min "C", max "d"
+            assert(minC == "C")
+            assert(maxC == "d")
+          } else {
+            fail(s"Unexpected partition: $path")
+          }
+        }
+      }
+    }
+  }
+
+  test("stats: collect min/max for collated nested struct fields") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val nested = new StructType()
+        .add("s1", utf8Lcase)
+        .add("i1", INTEGER)
+      val schema = new StructType()
+        .add("nested", nested)
+
+      val txn = getCreateTxn(engine, tblPath, schema)
+      commitTransaction(txn, engine, emptyIterable())
+
+      val batchSize = 4
+      val s1Values = Array("b", "A", "B", "a").map(_.asInstanceOf[AnyRef])
+      val i1Values = Array[java.lang.Integer](3, -1, 10, 5)
+      val s1 = DefaultGenericVector.fromArray(utf8Lcase, s1Values)
+      val i1 = DefaultGenericVector.fromArray(INTEGER, i1Values.asInstanceOf[Array[AnyRef]])
+      val nestedVector = new DefaultStructVector(
+        batchSize,
+        nested,
+        Optional.empty(),
+        Array[ColumnVector](s1, i1))
+      val batch = new DefaultColumnarBatch(
+        batchSize,
+        schema,
+        Array[ColumnVector](nestedVector))
+      val fcb = new FilteredColumnarBatch(batch, Optional.empty())
+
+      val commit = appendData(engine, tblPath, data = Seq(Map.empty[String, Literal] -> Seq(fcb)))
+      verifyCommitResult(commit, expVersion = 1, expIsReadyForCheckpoint = false)
+
+      // Read stats JSON
+      val snapshot = Table.forPath(engine, tblPath).getLatestSnapshot(engine)
+      val scan = snapshot.getScanBuilder().build()
+      val scanFiles = scan.asInstanceOf[ScanImpl].getScanFiles(engine, true).toSeq
+        .flatMap(_.getRows.toSeq)
+      val statsJson = scanFiles.headOption.flatMap { row =>
+        val add = row.getStruct(row.getSchema.indexOf("add"))
+        val idx = add.getSchema.indexOf("stats")
+        if (idx >= 0 && !add.isNullAt(idx)) Some(add.getString(idx)) else None
+      }.getOrElse(fail("Stats JSON not found"))
+
+      val mapper = JsonUtils.mapper()
+      val statsNode = mapper.readTree(statsJson)
+      val minValues = statsNode.get("minValues")
+      val maxValues = statsNode.get("maxValues")
+
+      val minNested = minValues.get("nested")
+      val maxNested = maxValues.get("nested")
+
+      // For s1: [b, A, B, a] -> min "A", max "b"
+      assert(minNested.get("s1").asText() == "A")
+      assert(maxNested.get("s1").asText() == "b")
+
+      // For i1: [3, -1, 10, 5] -> min -1, max 10
+      assert(minNested.get("i1").asInt() == -1)
+      assert(maxNested.get("i1").asInt() == 10)
+    }
+  }
+
+  test("stats: arrays and maps produce no stats; collated string field stats present") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val unicode = new StringType("ICU.UNICODE")
+      val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+      val schema = new StructType()
+        .add("name", unicode)
+        .add("arr", new ArrayType(utf8Lcase, true))
+        .add("map", new MapType(STRING, utf8Lcase, true))
+
+      val txn = getCreateTxn(engine, tblPath, schema)
+      commitTransaction(txn, engine, emptyIterable())
+
+      val batchSize = 4
+      val nameValues = Array("b", "A", "B", "a").map(_.asInstanceOf[AnyRef])
+      val nameVec = DefaultGenericVector.fromArray(unicode, nameValues)
+
+      val arrValues: Seq[Seq[AnyRef]] = (0 until batchSize).map { i =>
+        Seq(s"x$i").map(_.asInstanceOf[AnyRef])
+      }
+      val arrVec = buildArrayVector(arrValues, utf8Lcase, containsNull = true)
+
+      val mapType = new MapType(STRING, utf8Lcase, true)
+      val mapValues: Seq[Map[AnyRef, AnyRef]] = (0 until batchSize).map { i =>
+        Map[AnyRef, AnyRef](s"k$i" -> s"v$i")
+      }
+      val mapVec = buildMapVector(mapValues, mapType)
+
+      val batch = new DefaultColumnarBatch(
+        batchSize,
+        schema,
+        Array[ColumnVector](nameVec, arrVec, mapVec))
+      val fcb = new FilteredColumnarBatch(batch, Optional.empty())
+
+      val commit = appendData(engine, tblPath, data = Seq(Map.empty[String, Literal] -> Seq(fcb)))
+      verifyCommitResult(commit, expVersion = 1, expIsReadyForCheckpoint = false)
+
+      // Read stats JSON
+      val snapshot = Table.forPath(engine, tblPath).getLatestSnapshot(engine)
+      val scan = snapshot.getScanBuilder().build()
+      val scanFiles = scan.asInstanceOf[ScanImpl].getScanFiles(engine, true).toSeq
+        .flatMap(_.getRows.toSeq)
+      val statsJson = scanFiles.headOption.flatMap { row =>
+        val add = row.getStruct(row.getSchema.indexOf("add"))
+        val idx = add.getSchema.indexOf("stats")
+        if (idx >= 0 && !add.isNullAt(idx)) Some(add.getString(idx)) else None
+      }.getOrElse(fail("Stats JSON not found"))
+
+      val mapper = JsonUtils.mapper()
+      val statsNode = mapper.readTree(statsJson)
+      val minValues = statsNode.get("minValues")
+      val maxValues = statsNode.get("maxValues")
+
+      // String column stats are present
+      assert(minValues.get("name").asText() == "A")
+      assert(maxValues.get("name").asText() == "b")
+
+      // Array/Map columns should not have stats
+      assert(!minValues.has("arr"))
+      assert(!maxValues.has("arr"))
+      assert(!minValues.has("map"))
+      assert(!maxValues.has("map"))
+    }
+  }
+
+  test("create table with collated columns - collations writer feature in protocol") {
+    Seq(
+      new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add("val", new StringType("ICU.UNICODE")),
+      new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add("val", new StringType("ICU.SR_CYRL_SRB")),
+      new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add(
+          "info",
+          new StructType()
+            .add("name", new StringType("ICU.UNICODE.74.1"))),
+      new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add("tags", new ArrayType(new StringType("SPARK.UTF8_LCASE"), true)),
+      new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add(
+          "props",
+          new MapType(StringType.STRING, new StringType("ICU.UNICODE"), true))).foreach { schema =>
+      withTempDirAndEngine { (tblPath, engine) =>
+        appendData(
+          engine,
+          tblPath,
+          isNewTable = true,
+          schema,
+          data = Seq.empty)
+
+        val protocol = getProtocol(engine, tblPath)
+        assert(protocol.getWriterFeatures.contains("collations"))
+      }
+    }
+  }
+
+  test("create table without collated columns - collations feature NOT in protocol") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val schema = new StructType()
+        .add("id", IntegerType.INTEGER)
+        .add("name", StringType.STRING) // default UTF8_BINARY collation
+
+      appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        schema,
+        data = Seq.empty)
+
+      val protocol = getProtocol(engine, tblPath)
+      assert(
+        !protocol.getWriterFeatures.contains("collations"),
+        "Should NOT have 'collations' writer feature when schema has no custom collations")
+    }
+  }
+
+  test("write to golden table with collated columns (utf8_binary, utf8_lcase, unicode)") {
+    Seq(
+      ("collations-table", "collations"),
+      ("collations-preview-table", "collations-preview")).foreach {
+      case (collationTable, feature) =>
+        withTempDirAndEngine { (tblPath, engine) =>
+          copyTable(collationTable, tblPath)
+
+          val utf8Lcase = new StringType("SPARK.UTF8_LCASE")
+          val unicode = new StringType("ICU.UNICODE")
+
+          val schema = new StructType()
+            .add("id", IntegerType.INTEGER)
+            .add("utf8_binary_col", StringType.STRING)
+            .add("utf8_lcase_col", utf8Lcase)
+            .add("unicode_col", unicode)
+
+          // Verify golden table schema has expected collations
+          val goldenMetadata = getMetadata(engine, tblPath)
+          val goldenSchema =
+            DataTypeJsonSerDe.deserializeStructType(goldenMetadata.getSchemaString())
+          assert(goldenSchema === schema)
+
+          // Verify protocol has the expected collations writer feature
+          val protocol = getProtocol(engine, tblPath)
+          assert(protocol.getWriterFeatures.contains(feature))
+
+          // First append: data batch uses matching collations
+          val data1 = generateData(schema, Seq.empty, Map.empty, batchSize = 10, numBatches = 1)
+
+          val commitResult1 = appendData(
+            engine,
+            tblPath,
+            data = Seq(Map.empty[String, Literal] -> data1))
+
+          verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+          verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+          verifyWrittenContent(tblPath, schema, data1.flatMap(_.toTestRows))
+
+          // Second append: data batch uses different collations than the table schema
+          val diffCollationSchema = new StructType()
+            .add("id", IntegerType.INTEGER)
+            .add("utf8_binary_col", new StringType("ICU.UNICODE.75.1"))
+            .add("utf8_lcase_col", new StringType("SPARK.UTF8_BINARY"))
+            .add("unicode_col", utf8Lcase)
+
+          val data2 =
+            generateData(diffCollationSchema, Seq.empty, Map.empty, batchSize = 5, numBatches = 1)
+
+          val commitResult2 = appendData(
+            engine,
+            tblPath,
+            data = Seq(Map.empty[String, Literal] -> data2))
+
+          verifyCommitResult(commitResult2, expVersion = 2, expIsReadyForCheckpoint = false)
+          verifyCommitInfo(tblPath, version = 2, partitionCols = null)
+          verifyWrittenContent(tblPath, schema, (data1 ++ data2).flatMap(_.toTestRows))
+
+          // Verify the schema is preserved with collations after writes
+          val metadata = getMetadata(engine, tblPath)
+          val parsedSchema = DataTypeJsonSerDe.deserializeStructType(metadata.getSchemaString())
+          assert(parsedSchema === schema)
+
+          // After writes, the feature flags must not have changed
+          val protocolAfterWrite = getProtocol(engine, tblPath)
+          assert(protocolAfterWrite.getWriterFeatures.contains(feature))
+        }
+    }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Create table and insert data tests (CTAS & INSERT)
+  ///////////////////////////////////////////////////////////////////////////
+
+  test("cannot write to a table with an unsupported writer feature") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      createEmptyTable(
+        engine,
+        tablePath,
+        testSchema)
+
+      // Use your new commitUnsafe API to write an unsupported writer feature
+      import org.apache.spark.sql.delta.{DeltaLog, OptimisticTransaction}
+      import org.apache.spark.sql.delta.actions.Protocol
+
+      val deltaLog = DeltaLog.forTable(spark, tablePath)
+      val txn = deltaLog.startTransaction()
+
+      // Create Protocol action with unsupported writer feature
+      val protocolAction = Protocol(
+        minReaderVersion = 3,
+        minWriterVersion = 7,
+        readerFeatures = Some(Set.empty),
+        writerFeatures = Some(Set("testUnsupportedWriter")))
+
+      // Use your elegant API to commit directly to version 1
+      txn.commitUnsafe(tablePath, 1L, protocolAction)
+
+      val e = intercept[KernelException] {
+        getUpdateTxn(engine, tablePath)
+      }
+      assert(e.getMessage.contains("Unsupported Delta table feature"))
+    }
+  }
+
+  test("insert into table - table created from scratch") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        testSchema,
+        data = Seq(Map.empty[String, Literal] -> (dataBatches1 ++ dataBatches2)))
+
+      val expectedAnswer = dataBatches1.flatMap(_.toTestRows) ++ dataBatches2.flatMap(_.toTestRows)
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0)
+      verifyWrittenContent(tblPath, testSchema, expectedAnswer)
+    }
+  }
+
+  test("insert into table - already existing table") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        testSchema,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1))
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0, partitionCols = Seq.empty)
+      verifyWrittenContent(tblPath, testSchema, dataBatches1.flatMap(_.toTestRows))
+
+      val txn = getUpdateTxn(engine, tblPath)
+      assert(txn.getReadTableVersion == 0)
+      val commitResult1 =
+        commitAppendData(engine, txn, data = Seq(Map.empty[String, Literal] -> dataBatches2))
+
+      val expAnswer = dataBatches1.flatMap(_.toTestRows) ++ dataBatches2.flatMap(_.toTestRows)
+
+      verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+      verifyWrittenContent(tblPath, testSchema, expAnswer)
+    }
+  }
+
+  test("insert into table - fails when committing the same txn twice") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val table = Table.forPath(engine, tblPath)
+      val txn = getCreateTxn(engine, tblPath, schema = testSchema)
+
+      val txnState = txn.getTransactionState(engine)
+      val stagedFiles = stageData(txnState, Map.empty, dataBatches1)
+
+      val stagedActionsIterable = inMemoryIterable(stagedFiles)
+      val commitResult = commitTransaction(txn, engine, stagedActionsIterable)
+      assert(commitResult.getVersion == 0)
+
+      // try to commit the same transaction and expect failure
+      val ex = intercept[IllegalStateException] {
+        commitTransaction(txn, engine, stagedActionsIterable)
+      }
+      assert(ex.getMessage.contains(
+        "Transaction is already attempted to commit. Create a new transaction."))
+    }
+  }
+
+  test("insert into partitioned table - table created from scratch") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        isNewTable = true,
+        testPartitionSchema,
+        testPartitionColumns,
+        Seq(
+          Map("part1" -> ofInt(1), "part2" -> ofInt(2)) -> dataPartitionBatches1,
+          Map("part1" -> ofInt(4), "part2" -> ofInt(5)) -> dataPartitionBatches2))
+
+      val expData = dataPartitionBatches1.flatMap(_.toTestRows) ++
+        dataPartitionBatches2.flatMap(_.toTestRows)
+
+      verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tblPath, version = 0, testPartitionColumns)
+      verifyWrittenContent(tblPath, testPartitionSchema, expData)
+    }
+  }
+
+  test("insert into partitioned table - already existing table") {
+    withTempDirAndEngine { (tempTblPath, engine) =>
+      val tblPath = tempTblPath + "/table+ with special chars"
+      val partitionCols = Seq("part1", "part2")
+
+      {
+        val commitResult0 = appendData(
+          engine,
+          tblPath,
+          isNewTable = true,
+          testPartitionSchema,
+          testPartitionColumns,
+          data = Seq(Map("part1" -> ofInt(1), "part2" -> ofInt(2)) -> dataPartitionBatches1))
+
+        val expData = dataPartitionBatches1.flatMap(_.toTestRows)
+
+        verifyCommitResult(commitResult0, expVersion = 0, expIsReadyForCheckpoint = false)
+        verifyCommitInfo(tblPath, version = 0, partitionCols)
+        verifyWrittenContent(tblPath, testPartitionSchema, expData)
+      }
+      {
+        val commitResult1 = appendData(
+          engine,
+          tblPath,
+          data = Seq(Map("part1" -> ofInt(4), "part2" -> ofInt(5)) -> dataPartitionBatches2))
+
+        val expData = dataPartitionBatches1.flatMap(_.toTestRows) ++
+          dataPartitionBatches2.flatMap(_.toTestRows)
+
+        verifyCommitResult(commitResult1, expVersion = 1, expIsReadyForCheckpoint = false)
+        verifyCommitInfo(tblPath, version = 1, partitionCols = null)
+        verifyWrittenContent(tblPath, testPartitionSchema, expData)
+      }
+    }
+  }
+
+  test("insert into partitioned table - handling case sensitivity of partition columns") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val schema = new StructType()
+        .add("id", INTEGER)
+        .add("Name", STRING)
+        .add("Part1", DOUBLE) // partition column
+        .add("parT2", TIMESTAMP) // partition column
+
+      val partCols = Seq("part1", "Part2") // given as input to the txn builder
+
+      // expected partition cols in the commit info or elsewhere in the Delta log.
+      // it is expected to contain the partition columns in the same case as the schema
+      val expPartCols = Seq("Part1", "parT2")
+
+      val v0Part0Values = Map(
+        "PART1" -> ofDouble(1.0),
+        "pART2" -> ofTimestamp(1231212L))
+      val v0Part0Data =
+        generateData(schema, expPartCols, v0Part0Values, batchSize = 200, numBatches = 3)
+
+      val v0Part1Values = Map(
+        "Part1" -> ofDouble(7),
+        "PARt2" -> ofTimestamp(123112L))
+      val v0Part1Data =
+        generateData(schema, expPartCols, v0Part1Values, batchSize = 100, numBatches = 7)
+
+      val v1Part0Values = Map(
+        "PART1" -> ofNull(DOUBLE),
+        "pART2" -> ofTimestamp(1231212L))
+      val v1Part0Data =
+        generateData(schema, expPartCols, v1Part0Values, batchSize = 200, numBatches = 3)
+
+      val v1Part1Values = Map(
+        "Part1" -> ofDouble(7),
+        "PARt2" -> ofNull(TIMESTAMP))
+      val v1Part1Data =
+        generateData(schema, expPartCols, v1Part1Values, batchSize = 100, numBatches = 7)
+
+      val dataPerVersion = Map(
+        0 -> Seq(v0Part0Values -> v0Part0Data, v0Part1Values -> v0Part1Data),
+        1 -> Seq(v1Part0Values -> v1Part0Data, v1Part1Values -> v1Part1Data))
+
+      val expV0Data = v0Part0Data.flatMap(_.toTestRows) ++ v0Part1Data.flatMap(_.toTestRows)
+      val expV1Data = v1Part0Data.flatMap(_.toTestRows) ++ v1Part1Data.flatMap(_.toTestRows)
+
+      for (i <- 0 until 2) {
+        val commitResult = appendData(
+          engine,
+          tblPath,
+          isNewTable = i == 0,
+          if (i == 0) schema else null,
+          partCols,
+          dataPerVersion(i))
+
+        verifyCommitResult(commitResult, expVersion = i, expIsReadyForCheckpoint = false)
+        // partition cols are not written in the commit info for inserts
+        val partitionBy = if (i == 0) expPartCols else null
+        val expectedOperation = if (i == 0) CREATE_TABLE else WRITE
+        verifyCommitInfo(tblPath, version = i, partitionBy)
+        verifyWrittenContent(
+          tblPath,
+          schema,
+          if (i == 0) expV0Data else expV0Data ++ expV1Data)
+      }
+    }
+  }
+
+  Seq(10, 2).foreach { checkpointInterval =>
+    test(s"insert into partitioned table - isReadyForCheckpoint(interval=$checkpointInterval)") {
+      withTempDirAndEngine { (tblPath, engine) =>
+        val schema = new StructType()
+          .add("id", INTEGER)
+          .add("Name", STRING)
+          .add("Part1", DOUBLE) // partition column
+          .add("parT2", TIMESTAMP) // partition column
+
+        val partCols = Seq("Part1", "parT2")
+        val partValues = Map("PART1" -> ofDouble(1.0), "pART2" -> ofTimestamp(1231212L))
+        val data = Seq(
+          partValues -> generateData(schema, partCols, partValues, batchSize = 200, numBatches = 3))
+
+        // create a table first
+        appendData(engine, tblPath, isNewTable = true, schema, partCols, data) // version 0
+        var expData = data.map(_._2).flatMap(_.flatMap(_.toTestRows))
+        var currentTableVersion = 0
+
+        if (checkpointInterval != 10) {
+          // If it is not the default interval alter the table using Spark to set a
+          // custom checkpoint interval
+          setCheckpointInterval(tblPath, interval = checkpointInterval) // version 1
+          currentTableVersion = 1
+        }
+
+        def isCheckpointExpected(version: Long): Boolean = {
+          version != 0 && version % checkpointInterval == 0
+        }
+
+        for (i <- currentTableVersion + 1 until 31) {
+          val commitResult = appendData(engine, tblPath, data = data)
+
+          val parquetFileCount = dataFileCount(tblPath)
+          assert(parquetFileCount > 0)
+          checkpointIfReady(engine, tblPath, commitResult, expSize = parquetFileCount)
+
+          verifyCommitResult(commitResult, expVersion = i, isCheckpointExpected(i))
+
+          expData = expData ++ data.map(_._2).flatMap(_.flatMap(_.toTestRows))
+        }
+
+        // expect the checkpoints created at expected versions
+        Seq.range(0, 31).filter(isCheckpointExpected(_)).foreach { version =>
+          assertCheckpointExists(tblPath, atVersion = version)
+        }
+
+        // delete all commit files before version 30 in both cases and expect the read to pass as
+        // there is a checkpoint at version 30 and should be used for state reconstruction.
+        deleteDeltaFilesBefore(tblPath, beforeVersion = 30)
+        verifyWrittenContent(tblPath, schema, expData)
+      }
+    }
+  }
+
+  Seq(true, false).foreach { includeTimestampNtz =>
+    test(s"insert into table - all supported types data - " +
+      s"timestamp_ntz included = $includeTimestampNtz") {
+      withTempDirAndEngine { (tblPath, engine) =>
+        val parquetAllTypes = goldenTablePath("parquet-all-types")
+        val goldenTableSchema = tableSchema(parquetAllTypes)
+        val schema = if (includeTimestampNtz) goldenTableSchema
+        else removeTimestampNtzTypeColumns(goldenTableSchema)
+
+        val data = readTableUsingKernel(engine, parquetAllTypes, schema).toSeq
+        val dataWithPartInfo = Seq(Map.empty[String, Literal] -> data)
+
+        appendData(engine, tblPath, isNewTable = true, schema, data = dataWithPartInfo)
+        var expData = dataWithPartInfo.flatMap(_._2).flatMap(_.toTestRows)
+
+        val checkpointInterval = 4
+        setCheckpointInterval(tblPath, checkpointInterval)
+
+        for (i <- 2 until 5) {
+          // insert until a checkpoint is required
+          val commitResult = appendData(engine, tblPath, data = dataWithPartInfo)
+
+          expData = expData ++ dataWithPartInfo.flatMap(_._2).flatMap(_.toTestRows)
+          checkpointIfReady(engine, tblPath, commitResult, expSize = i /* one file per version */ )
+
+          verifyCommitResult(commitResult, expVersion = i, i % checkpointInterval == 0)
+          verifyCommitInfo(tblPath, version = i, null)
+          verifyWrittenContent(tblPath, schema, expData)
+        }
+        assertCheckpointExists(tblPath, atVersion = checkpointInterval)
+      }
+    }
+  }
+
+  Seq(true, false).foreach { includeTimestampNtz =>
+    test(s"insert into partitioned table - all supported partition column types data - " +
+      s"timestamp_ntz included = $includeTimestampNtz") {
+      withTempDirAndEngine { (tblPath, engine) =>
+        val parquetAllTypes = goldenTablePath("parquet-all-types")
+        val goldenTableSchema = tableSchema(parquetAllTypes)
+        val schema = if (includeTimestampNtz) goldenTableSchema
+        else removeTimestampNtzTypeColumns(goldenTableSchema)
+
+        val partCols = Seq(
+          "byteType",
+          "shortType",
+          "integerType",
+          "longType",
+          "floatType",
+          "doubleType",
+          "decimal",
+          "booleanType",
+          "stringType",
+          "binaryType",
+          "dateType",
+          "timestampType") ++ (if (includeTimestampNtz) Seq("timestampNtzType") else Seq.empty)
+        val casePreservingPartCols =
+          casePreservingPartitionColNames(schema, partCols.asJava).asScala.toSeq
+
+        // get the partition values from the data batch at the given rowId
+        def getPartitionValues(batch: ColumnarBatch, rowId: Int): Map[String, Literal] = {
+          casePreservingPartCols.map { partCol =>
+            val colIndex = schema.indexOf(partCol)
+            val vector = batch.getColumnVector(colIndex)
+
+            val literal = if (vector.isNullAt(rowId)) {
+              Literal.ofNull(vector.getDataType)
+            } else {
+              vector.getDataType match {
+                case _: ByteType => Literal.ofByte(vector.getByte(rowId))
+                case _: ShortType => Literal.ofShort(vector.getShort(rowId))
+                case _: IntegerType => Literal.ofInt(vector.getInt(rowId))
+                case _: LongType => Literal.ofLong(vector.getLong(rowId))
+                case _: FloatType => Literal.ofFloat(vector.getFloat(rowId))
+                case _: DoubleType => Literal.ofDouble(vector.getDouble(rowId))
+                case dt: DecimalType =>
+                  Literal.ofDecimal(vector.getDecimal(rowId), dt.getPrecision, dt.getScale)
+                case _: BooleanType => Literal.ofBoolean(vector.getBoolean(rowId))
+                case _: StringType => Literal.ofString(vector.getString(rowId))
+                case _: BinaryType => Literal.ofBinary(vector.getBinary(rowId))
+                case _: DateType => Literal.ofDate(vector.getInt(rowId))
+                case _: TimestampType => Literal.ofTimestamp(vector.getLong(rowId))
+                case _: TimestampNTZType => Literal.ofTimestampNtz(vector.getLong(rowId))
+                case _ =>
+                  throw new IllegalArgumentException(s"Unsupported type: ${vector.getDataType}")
+              }
+            }
+            (partCol, literal)
+          }.toMap
+        }
+
+        val data = readTableUsingKernel(engine, parquetAllTypes, schema).toSeq
+
+        // From the above table read data, convert each row as a new batch with partition info
+        // Take the values of the partitionCols from the data and create a new batch with the
+        // selection vector to just select a single row.
+        var dataWithPartInfo = Seq.empty[(Map[String, Literal], Seq[FilteredColumnarBatch])]
+
+        data.foreach { filteredBatch =>
+          val batch = filteredBatch.getData
+          Seq.range(0, batch.getSize).foreach { rowId =>
+            val partValues = getPartitionValues(batch, rowId)
+            val filteredBatch = new FilteredColumnarBatch(
+              batch,
+              Optional.of(selectSingleElement(batch.getSize, rowId)))
+            dataWithPartInfo = dataWithPartInfo :+ (partValues, Seq(filteredBatch))
+          }
+        }
+
+        appendData(engine, tblPath, isNewTable = true, schema, partCols, dataWithPartInfo)
+        verifyCommitInfo(tblPath, version = 0, casePreservingPartCols)
+
+        var expData = dataWithPartInfo.flatMap(_._2).flatMap(_.toTestRows)
+
+        val checkpointInterval = 2
+        setCheckpointInterval(tblPath, checkpointInterval) // version 1
+
+        for (i <- 2 until 4) {
+          // insert until a checkpoint is required
+          val commitResult = appendData(engine, tblPath, data = dataWithPartInfo)
+
+          expData = expData ++ dataWithPartInfo.flatMap(_._2).flatMap(_.toTestRows)
+
+          val fileCount = dataFileCount(tblPath)
+          checkpointIfReady(engine, tblPath, commitResult, expSize = fileCount)
+
+          verifyCommitResult(commitResult, expVersion = i, i % checkpointInterval == 0)
+          verifyCommitInfo(tblPath, version = i, partitionCols = null)
+          verifyWrittenContent(tblPath, schema, expData)
+        }
+
+        assertCheckpointExists(tblPath, atVersion = checkpointInterval)
+      }
+    }
+  }
+
+  test("insert into table - given data schema mismatch") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val ex = intercept[KernelException] {
+        val data = Seq(Map.empty[String, Literal] -> dataPartitionBatches1) // data schema mismatch
+        appendData(engine, tblPath, isNewTable = true, testSchema, data = data)
+      }
+      assert(ex.getMessage.contains("The schema of the data to be written to " +
+        "the table doesn't match the table schema"))
+    }
+  }
+
+  test("insert into table - missing partition column info") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val ex = intercept[IllegalArgumentException] {
+        appendData(
+          engine,
+          tblPath,
+          isNewTable = true,
+          testPartitionSchema,
+          testPartitionColumns,
+          data = Seq(Map("part1" -> ofInt(1)) -> dataPartitionBatches1) // missing part2
+        )
+      }
+      assert(ex.getMessage.contains(
+        "Partition values provided are not matching the partition columns."))
+    }
+  }
+
+  test("insert into partitioned table - invalid type of partition value") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val ex = intercept[IllegalArgumentException] {
+        // part2 type should be int, be giving a string value
+        val data = Seq(Map("part1" -> ofInt(1), "part2" -> ofString("sdsd"))
+          -> dataPartitionBatches1)
+        appendData(
+          engine,
+          tblPath,
+          isNewTable = true,
+          testPartitionSchema,
+          testPartitionColumns,
+          data)
+      }
+      assert(ex.getMessage.contains(
+        "Partition column part2 is of type integer but the value provided is of type string"))
+    }
+  }
+
+  test("insert into table - idempotent writes") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val data = Seq(Map("part1" -> ofInt(1), "part2" -> ofInt(2)) -> dataPartitionBatches1)
+      var expData = Seq.empty[TestRow] // as the data in inserted, update this.
+
+      def prepTxnAndActions(newTbl: Boolean, appId: String, txnVer: Long)
+          : (Transaction, CloseableIterable[Row]) = {
+
+        val txn = if (newTbl) {
+          getCreateTxn(
+            engine,
+            tblPath,
+            schema = testPartitionSchema,
+            partCols = testPartitionColumns)
+        } else {
+          getUpdateTxn(
+            engine,
+            tblPath,
+            txnId = if (appId != null) Some((appId, txnVer)) else None)
+        }
+
+        val combinedActions = inMemoryIterable(
+          data.map { case (partValues, partData) =>
+            stageData(txn.getTransactionState(engine), partValues, partData)
+          }.reduceLeft(_ combine _))
+
+        (txn, combinedActions)
+      }
+
+      def commitAndVerify(
+          newTbl: Boolean,
+          txn: Transaction,
+          actions: CloseableIterable[Row],
+          expTblVer: Long): Unit = {
+        val commitResult = commitTransaction(txn, engine, actions)
+
+        expData = expData ++ data.flatMap(_._2).flatMap(_.toTestRows)
+
+        verifyCommitResult(commitResult, expVersion = expTblVer, expIsReadyForCheckpoint = false)
+        val expPartCols = if (newTbl) testPartitionColumns else null
+        val expOperation = if (newTbl) CREATE_TABLE else WRITE
+        verifyCommitInfo(tblPath, version = expTblVer, expPartCols)
+        verifyWrittenContent(tblPath, testPartitionSchema, expData)
+      }
+
+      def addDataWithTxnId(newTbl: Boolean, appId: String, txnVer: Long, expTblVer: Long): Unit = {
+        val (txn, combinedActions) = prepTxnAndActions(newTbl, appId, txnVer)
+        commitAndVerify(newTbl, txn, combinedActions, expTblVer)
+      }
+
+      def expFailure(appId: String, txnVer: Long, latestTxnVer: Long)(fn: => Any): Unit = {
+        val ex = intercept[ConcurrentTransactionException] {
+          fn
+        }
+        assert(ex.getMessage.contains(s"This error occurs when multiple updates are using the " +
+          s"same transaction identifier to write into this table.\nApplication ID: $appId, " +
+          s"Attempted version: $txnVer, Latest version in table: $latestTxnVer"))
+      }
+
+      // Create a transaction with id (txnAppId1, 0) and commit it
+      addDataWithTxnId(newTbl = true, appId = "txnAppId1", txnVer = 0, expTblVer = 0)
+
+      // Try to create a transaction with id (txnAppId1, 1) and commit it - should be valid
+      addDataWithTxnId(newTbl = false, appId = "txnAppId1", txnVer = 1, expTblVer = 1)
+
+      // Try to create a transaction with id (txnAppId1, 1) and try to commit it
+      // Should fail the it is already committed above.
+      expFailure("txnAppId1", txnVer = 1, latestTxnVer = 1) {
+        addDataWithTxnId(newTbl = false, "txnAppId1", txnVer = 1, expTblVer = 2)
+      }
+
+      // append with no txn id
+      addDataWithTxnId(newTbl = false, appId = null, txnVer = 0, expTblVer = 2)
+
+      // Try to create a transaction with id (txnAppId2, 1) and commit it
+      // Should be successful as the transaction app id is different
+      addDataWithTxnId(newTbl = false, "txnAppId2", txnVer = 1, expTblVer = 3)
+
+      // Try to create a transaction with id (txnAppId2, 0) and commit it
+      // Should fail as the transaction app id is same but the version is less than the committed
+      expFailure("txnAppId2", txnVer = 0, latestTxnVer = 1) {
+        addDataWithTxnId(newTbl = false, "txnAppId2", txnVer = 0, expTblVer = 4)
+      }
+
+      // Start a transaction (txnAppId2, 2), but don't commit it yet
+      val (txn, combinedActions) = prepTxnAndActions(newTbl = false, "txnAppId2", txnVer = 2)
+      // Now start a new transaction with the same id (txnAppId2, 2) and commit it
+      addDataWithTxnId(newTbl = false, "txnAppId2", txnVer = 2, expTblVer = 4)
+      // Now try to commit the previous transaction (txnAppId2, 2) - should fail
+      expFailure("txnAppId2", txnVer = 2, latestTxnVer = 2) {
+        commitAndVerify(newTbl = false, txn, combinedActions, expTblVer = 5)
+      }
+
+      // Start a transaction (txnAppId2, 3), but don't commit it yet
+      val (txn2, combinedActions2) = prepTxnAndActions(newTbl = false, "txnAppId2", txnVer = 3)
+      // Now start a new transaction with the different id (txnAppId1, 10) and commit it
+      addDataWithTxnId(newTbl = false, "txnAppId1", txnVer = 10, expTblVer = 5)
+      // Now try to commit the previous transaction (txnAppId2, 3) - should pass
+      commitAndVerify(newTbl = false, txn2, combinedActions2, expTblVer = 6)
+    }
+  }
+
+  test("insert into table - write stats and validate they can be read by Spark ") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      // Configure the table property for stats collection via TableConfig.
+      val numIndexedCols = 5
+      val tableProperties = Map(TableConfig.
+      DATA_SKIPPING_NUM_INDEXED_COLS.getKey -> numIndexedCols.toString)
+
+      // Schema of the table with some nested types
+      val schema = new StructType()
+        .add("id", INTEGER)
+        .add("name", STRING)
+        .add("height", DOUBLE)
+        .add("timestamp", TIMESTAMP)
+        .add(
+          "metrics",
+          new StructType()
+            .add("temperature", DoubleType.DOUBLE)
+            .add("humidity", FloatType.FLOAT))
+
+      // Create the table with the given schema and table properties.
+      val txn =
+        getCreateTxn(engine, tblPath, schema, tableProperties = tableProperties)
+      commitTransaction(txn, engine, emptyIterable())
+
+      val dataBatches1 = generateData(schema, Seq.empty, Map.empty, batchSize = 10, numBatches = 1)
+      val dataBatches2 = generateData(schema, Seq.empty, Map.empty, batchSize = 20, numBatches = 1)
+
+      // Write initial data via Kernel.
+      val commitResult0 = appendData(
+        engine,
+        tblPath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches1))
+      verifyCommitResult(commitResult0, expVersion = 1, expIsReadyForCheckpoint = false)
+      verifyWrittenContent(tblPath, schema, dataBatches1.flatMap(_.getRows().toSeq).map(TestRow(_)))
+
+      // Append additional data.
+      val commitResult1 = appendData(
+        engine,
+        tblPath,
+        data = Seq(Map.empty[String, Literal] -> dataBatches2))
+      val expectedRows = dataBatches1.flatMap(_.getRows().toSeq) ++
+        dataBatches2.flatMap(_.getRows().toSeq)
+      verifyCommitResult(commitResult1, expVersion = 2, expIsReadyForCheckpoint = false)
+      verifyWrittenContent(tblPath, schema, expectedRows.map(TestRow(_)))
+    }
+  }
+
+  test("insert - validate DATA_SKIPPING_NUM_INDEXED_COLS is respected when collecting stats") {
+    withTempDirAndEngine { (tblPath, engine) =>
+      val numIndexedCols = 2
+      val tableProps = Map(TableConfig.DATA_SKIPPING_NUM_INDEXED_COLS
+        .getKey -> numIndexedCols.toString)
+      val schema = new StructType()
+        .add("id", INTEGER)
+        .add(
+          "name",
+          new StructType()
+            .add("height", DoubleType.DOUBLE)
+            .add("timestamp", TimestampType.TIMESTAMP))
+
+      // Create table with stats collection enabled.
+      val txn = getCreateTxn(engine, tblPath, schema, tableProperties = tableProps)
+      commitTransaction(txn, engine, emptyIterable())
+
+      // Write one batch of data.
+      val dataBatches = generateData(schema, Seq.empty, Map.empty, batchSize = 10, numBatches = 1)
+      val commitResult =
+        appendData(engine, tblPath, data = Seq(Map.empty[String, Literal] -> dataBatches))
+      verifyCommitResult(commitResult, expVersion = 1, expIsReadyForCheckpoint = false)
+
+      // Retrieve the stats JSON from the file.
+      val snapshot = Table.forPath(engine, tblPath).getLatestSnapshot(engine)
+      val scan = snapshot.getScanBuilder().build()
+      val scanFiles = scan.asInstanceOf[ScanImpl].getScanFiles(engine, true)
+        .toSeq.flatMap(_.getRows.toSeq)
+      val statsJson = scanFiles.headOption.flatMap { row =>
+        val addFile = row.getStruct(row.getSchema.indexOf("add"))
+        val statsIdx = addFile.getSchema.indexOf("stats")
+        if (statsIdx >= 0 && !addFile.isNullAt(statsIdx)) {
+          Some(addFile.getString(statsIdx))
+        } else {
+          None
+        }
+      }.getOrElse(fail("Stats JSON not found"))
+
+      // With numIndexedCols = 2, we expect stats for id and name.height, but not for name.timestamp
+      assert(statsJson.contains("\"id\""), "Stats should contain 'id' field")
+      assert(statsJson.contains("\"height\""), "Stats should contain 'height' field")
+      assert(
+        !statsJson.contains("\"timestamp\""),
+        "Stats should not contain 'timestamp' field, as it exceeds numIndexedCols")
+    }
+  }
+
+  test("conflicts - creating new table - table created by other txn after current txn start") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val losingTx = getCreateTxn(engine, tablePath, schema = testSchema)
+
+      // don't commit losingTxn, instead create a new txn and commit it
+      val winningTx = getCreateTxn(engine, tablePath, schema = testSchema)
+      val winningTxResult = commitTransaction(winningTx, engine, emptyIterable())
+
+      // now attempt to commit the losingTxn
+      val ex = intercept[ProtocolChangedException] {
+        commitTransaction(losingTx, engine, emptyIterable())
+      }
+      assert(ex.getMessage.contains(
+        "Transaction has encountered a conflict and can not be committed."))
+      // helpful message for table creation conflict
+      assert(ex.getMessage.contains("This happens when multiple writers are " +
+        "writing to an empty directory. Creating the table ahead of time will avoid " +
+        "this conflict."))
+
+      verifyCommitResult(winningTxResult, expVersion = 0, expIsReadyForCheckpoint = false)
+      verifyCommitInfo(tablePath = tablePath, version = 0)
+      verifyWrittenContent(tablePath, testSchema, Seq.empty)
+    }
+  }
+
+  test("insert into table - validate serialized json stats equal Spark written stats") {
+    withTempDirAndEngine { (dir, engine) =>
+      // Test with all Skipping eligible types.
+      // TODO(Issue: 4284): Validate TIMESTAMP and TIMESTAMP_NTZ serialization
+      // format.
+      val schema = new StructType()
+        .add("byteCol", BYTE)
+        .add("shortCol", SHORT)
+        .add("intCol", INTEGER)
+        .add("longCol", LONG)
+        .add("floatCol", FLOAT)
+        .add("doubleCol", DOUBLE)
+        .add("stringCol", STRING)
+        .add("dateCol", DATE)
+        .add(
+          "structCol",
+          new StructType()
+            .add("nestedDecimal", DecimalType.USER_DEFAULT)
+            .add("nestedDoubleCol", DOUBLE))
+
+      // Create "kernel" and "spark-copy" directories
+      val kernelPath = new File(dir, "kernel").getAbsolutePath
+      val sparkPath = new File(dir, "spark-copy").getAbsolutePath
+
+      // Write a batch of data using the Kernel
+      val batch =
+        generateData(schema, Seq.empty, Map.empty, batchSize = 10, numBatches = 1)
+      appendData(
+        engine,
+        kernelPath,
+        isNewTable = true,
+        schema,
+        data = Seq(Map.empty[String, Literal] -> batch))
+
+      spark.read.format("delta").load(kernelPath)
+        .write.format("delta").mode("overwrite").save(sparkPath)
+
+      val mapper = JsonUtils.mapper()
+      val kernelStats = collectStatsFromAddFiles(engine, kernelPath).map(mapper.readTree)
+      val sparkStats = collectStatsFromAddFiles(engine, sparkPath).map(mapper.readTree)
+
+      require(
+        kernelStats.nonEmpty && sparkStats.nonEmpty,
+        "stats collected from AddFiles should be non-empty")
+      // Since Spark doesn't write tightBounds but Kernel now does,
+      // we need to compare stats after removing the tightBounds field from Kernel stats
+      val kernelStatsWithoutTightBounds = kernelStats.map { node =>
+        val objectNode =
+          node.deepCopy().asInstanceOf[ObjectNode]
+        objectNode.remove("tightBounds")
+        objectNode
+      }
+
+      assert(
+        kernelStatsWithoutTightBounds.toSet == sparkStats.toSet,
+        s"\nKernel stats (without tightBounds):" +
+          s"\n${kernelStatsWithoutTightBounds.mkString("\n")}\n" +
+          s"Spark stats:\n${sparkStats.mkString("\n")}")
+    }
+  }
+
+  test("conflicts - table metadata has changed after the losing txn has started") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val testData = Seq(Map.empty[String, Literal] -> dataBatches1)
+
+      // create a new table and commit it
+      appendData(engine, tablePath, isNewTable = true, testSchema, data = testData)
+
+      // start the losing transaction
+      val losingTx = getUpdateTxn(engine, tablePath)
+
+      // don't commit losingTxn, instead create a new txn (that changes metadata) and commit it
+      spark.sql("ALTER TABLE delta.`" + tablePath + "` ADD COLUMN newCol INT")
+
+      // now attempt to commit the losingTxn
+      val ex = intercept[MetadataChangedException] {
+        commitTransaction(losingTx, engine, emptyIterable())
+      }
+      assert(ex.getMessage.contains("The metadata of the Delta table has been changed " +
+        "by a concurrent update. Please try the operation again."))
+    }
+  }
+
+  // Different scenarios that have multiple winning txns and with a checkpoint in between.
+  Seq(1, 5, 12).foreach { numWinningTxs =>
+    test(s"conflicts - concurrent data append ($numWinningTxs) after the losing txn has started") {
+      withTempDirAndEngine { (tablePath, engine) =>
+        val testData = Seq(Map.empty[String, Literal] -> dataBatches1)
+        var expData = Seq.empty[TestRow]
+
+        // create a new table and commit it
+        appendData(engine, tablePath, isNewTable = true, testSchema, data = testData)
+        expData ++= testData.flatMap(_._2).flatMap(_.toTestRows)
+
+        // start the losing transaction
+        val txn1 = getUpdateTxn(engine, tablePath)
+
+        // don't commit txn1 yet, instead commit nex txns (that appends data) and commit it
+        Seq.range(0, numWinningTxs).foreach { i =>
+          appendData(engine, tablePath, data = Seq(Map.empty[String, Literal] -> dataBatches2))
+          expData ++= dataBatches2.flatMap(_.toTestRows)
+        }
+
+        // add data using the txn1
+        val txn1State = txn1.getTransactionState(engine)
+        val actions = inMemoryIterable(stageData(txn1State, Map.empty, dataBatches2))
+        expData ++= dataBatches2.flatMap(_.toTestRows)
+
+        val txn1Result = commitTransaction(txn1, engine, actions)
+
+        verifyCommitResult(
+          txn1Result,
+          expVersion = numWinningTxs + 1,
+          expIsReadyForCheckpoint = false)
+        verifyCommitInfo(tablePath = tablePath, version = 0)
+        verifyWrittenContent(tablePath, testSchema, expData)
+      }
+    }
+  }
+
+  ///////////////////////////////////////////////////////////////////////////
+  // Change Data Feed (CDF) tests
+  ///////////////////////////////////////////////////////////////////////////
+
+  private def createAddFileRow(
+      path: String = s"part-${UUID.randomUUID()}.parquet",
+      dataChange: Boolean = true): Row = {
+    import io.delta.kernel.internal.actions.{AddFile, SingleAction}
+    import io.delta.kernel.internal.util.PartitionUtils
+
+    val partitionValues = PartitionUtils.serializePartitionMap(
+      java.util.Collections.emptyMap[String, Literal]())
+
+    val addFileRow = AddFile.createAddFileRow(
+      testSchema,
+      path,
+      partitionValues,
+      100L, // size
+      System.currentTimeMillis(), // modificationTime
+      dataChange,
+      Optional.empty(), // deletionVector
+      Optional.empty(), // tags
+      Optional.empty(), // baseRowId
+      Optional.empty(), // defaultRowCommitVersion
+      Optional.empty() // stats
+    )
+
+    SingleAction.createAddFileSingleAction(addFileRow)
+  }
+
+  // Helper to create a mock RemoveFile action row
+  private def createRemoveFileRow(
+      path: String,
+      dataChange: Boolean = true): Row = {
+    import io.delta.kernel.internal.actions.{RemoveFile, SingleAction}
+
+    val removeFileRow = new GenericRow(
+      RemoveFile.FULL_SCHEMA,
+      Map[Integer, Object](
+        Integer.valueOf(RemoveFile.FULL_SCHEMA.indexOf("path")) -> path,
+        Integer.valueOf(RemoveFile.FULL_SCHEMA.indexOf("deletionTimestamp")) -> Long.box(
+          System.currentTimeMillis()),
+        Integer.valueOf(RemoveFile.FULL_SCHEMA.indexOf("dataChange")) -> Boolean.box(dataChange),
+        Integer.valueOf(RemoveFile.FULL_SCHEMA.indexOf("size")) -> Long.box(100L)).asJava)
+
+    SingleAction.createRemoveFileSingleAction(removeFileRow)
+  }
+
+  // Test cases: (description, actions, shouldSucceed)
+  val cdfTestCases: Seq[(String, Seq[Row], Boolean)] = Seq(
+    ("add with dataChange=true", Seq(createAddFileRow(dataChange = true)), true),
+    ("add with dataChange=false", Seq(createAddFileRow(dataChange = false)), true),
+    (
+      "multiple adds with dataChange=true",
+      Seq(createAddFileRow(dataChange = true), createAddFileRow(dataChange = true)),
+      true),
+    (
+      "multiple removes with dataChange=true", {
+        val path1 = "file1.parquet"
+        val path2 = "file2.parquet"
+        Seq(
+          createAddFileRow(path1, dataChange = false),
+          createAddFileRow(path2, dataChange = false),
+          createRemoveFileRow(path1, dataChange = true),
+          createRemoveFileRow(path2, dataChange = true))
+      },
+      true),
+    (
+      "add dataChange=true, remove dataChange=false", {
+        val path = "file1.parquet"
+        Seq(
+          createAddFileRow(path, dataChange = true),
+          createRemoveFileRow(path, dataChange = false))
+      },
+      true),
+    (
+      "add dataChange=true, remove dataChange=true", {
+        val path = "file1.parquet"
+        Seq(createAddFileRow(path, dataChange = true), createRemoveFileRow(path, dataChange = true))
+      },
+      false))
+
+  cdfTestCases.foreach { case (desc, actions, shouldSucceed) =>
+    test(s"CDF-enabled table: $desc - ${if (shouldSucceed) "succeeds" else "fails"}") {
+      withTempDirAndEngine { (tablePath, engine) =>
+        val tableProps = Map(TableConfig.CHANGE_DATA_FEED_ENABLED.getKey -> "true")
+        val txn = getCreateTxn(engine, tablePath, testSchema, tableProperties = tableProps)
+
+        val actionsIterable = inMemoryIterable(toCloseableIterator(actions.asJava.iterator()))
+
+        if (shouldSucceed) {
+          val result = commitTransaction(txn, engine, actionsIterable)
+          assert(result.getVersion === 0)
+        } else {
+          intercept[KernelException] {
+            commitTransaction(txn, engine, actionsIterable)
+          }
+        }
+      }
+    }
+  }
+
+  def removeTimestampNtzTypeColumns(structType: StructType): StructType = {
+    def process(dataType: DataType): Option[DataType] = dataType match {
+      case a: ArrayType =>
+        val newElementType = process(a.getElementType)
+        newElementType.map(new ArrayType(_, a.containsNull()))
+      case m: MapType =>
+        val newKeyType = process(m.getKeyType)
+        val newValueType = process(m.getValueType)
+        (newKeyType, newValueType) match {
+          case (Some(newKeyType), Some(newValueType)) =>
+            Some(new MapType(newKeyType, newValueType, m.isValueContainsNull))
+          case _ => None
+        }
+      case _: TimestampNTZType => None // ignore
+      case s: StructType =>
+        val newType = removeTimestampNtzTypeColumns(s);
+        if (newType.length() > 0) {
+          Some(newType)
+        } else {
+          None
+        }
+      case _ => Some(dataType)
+    }
+
+    var newStructType = new StructType();
+    structType.fields().forEach { field =>
+      val newDataType = process(field.getDataType)
+      if (newDataType.isDefined) {
+        newStructType = newStructType.add(field.getName(), newDataType.get)
+      }
+    }
+    newStructType
+  }
+}

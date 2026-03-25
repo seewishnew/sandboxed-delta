@@ -1,0 +1,329 @@
+/*
+ * Copyright (2023) The Delta Lake Project Authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * This file contains code from the Apache Spark project (original license below).
+ * It contains modifications which are licensed as specified above.
+ */
+
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.delta.kernel.types;
+
+import io.delta.kernel.internal.util.Preconditions;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/** The metadata for a given {@link StructField}. The contents are immutable. */
+public final class FieldMetadata {
+  private final Map<String, Object> metadata;
+
+  private FieldMetadata(Map<String, Object> metadata) {
+    this.metadata = Collections.unmodifiableMap(metadata);
+  }
+
+  /** @return list of the key-value pairs in this {@link FieldMetadata} */
+  public Map<String, Object> getEntries() {
+    return metadata;
+  }
+
+  /**
+   * @param key the key to check for
+   * @return True if {@code this} contains a mapping for the given key, False otherwise
+   */
+  public boolean contains(String key) {
+    return metadata.containsKey(key);
+  }
+
+  /**
+   * @param key the key to check for
+   * @return the value to which the specified key is mapped, or null if there is no mapping for the
+   *     given key
+   */
+  public Object get(String key) {
+    return metadata.get(key);
+  }
+
+  public Long getLong(String key) {
+    return get(key, Long.class);
+  }
+
+  public Double getDouble(String key) {
+    return get(key, Double.class);
+  }
+
+  public Boolean getBoolean(String key) {
+    return get(key, Boolean.class);
+  }
+
+  public String getString(String key) {
+    return get(key, String.class);
+  }
+
+  public MetadataColumnSpec getMetadataColumnSpec(String key) {
+    return get(key, MetadataColumnSpec.class);
+  }
+
+  public FieldMetadata getMetadata(String key) {
+    return get(key, FieldMetadata.class);
+  }
+
+  public Long[] getLongArray(String key) {
+    return get(key, Long[].class);
+  }
+
+  public Double[] getDoubleArray(String key) {
+    return get(key, Double[].class);
+  }
+
+  public Boolean[] getBooleanArray(String key) {
+    return get(key, Boolean[].class);
+  }
+
+  public String[] getStringArray(String key) {
+    return get(key, String[].class);
+  }
+
+  public FieldMetadata[] getMetadataArray(String key) {
+    return get(key, FieldMetadata[].class);
+  }
+
+  @Override
+  public String toString() {
+    return metadata.entrySet().stream()
+        .map(
+            entry -> {
+              String key = entry.getKey();
+              Object value = entry.getValue();
+              if (value == null) {
+                return key + "=null";
+              }
+              String valueStr =
+                  value.getClass().isArray() ? Arrays.toString((Object[]) value) : value.toString();
+
+              return key + "=" + valueStr;
+            })
+        .collect(Collectors.joining(", ", "{", "}"));
+  }
+
+  /** Are the metadata same, ignoring the specified keys? */
+  public boolean equalsIgnoreKeys(FieldMetadata other, Set<String> keys) {
+    Preconditions.checkArgument(keys != null, "keys must not be null");
+    if (this == other) {
+      return true;
+    }
+    if (other == null) {
+      return false;
+    }
+
+    Map<String, Object> filteredMetadata = new HashMap<>();
+    for (Map.Entry<String, Object> entry : this.metadata.entrySet()) {
+      if (!keys.contains(entry.getKey())) {
+        filteredMetadata.put(entry.getKey(), entry.getValue());
+      }
+    }
+    Map<String, Object> otherFilteredMetadata = new HashMap<>();
+    for (Map.Entry<String, Object> entry : other.metadata.entrySet()) {
+      if (!keys.contains(entry.getKey())) {
+        otherFilteredMetadata.put(entry.getKey(), entry.getValue());
+      }
+    }
+
+    if (filteredMetadata.size() != otherFilteredMetadata.size()) {
+      return false;
+    }
+    return filteredMetadata.entrySet().stream()
+        .allMatch(
+            e -> {
+              Object value = e.getValue();
+              Object otherValue = otherFilteredMetadata.get(e.getKey());
+              return Objects.deepEquals(value, otherValue);
+            });
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    FieldMetadata other = (FieldMetadata) o;
+    if (this.metadata.size() != other.metadata.size()) return false;
+    return this.metadata.entrySet().stream()
+        .allMatch(
+            e -> {
+              Object value = e.getValue();
+              Object otherValue = other.metadata.get(e.getKey());
+              return Objects.deepEquals(value, otherValue);
+            });
+  }
+
+  @Override
+  public int hashCode() {
+    return metadata.entrySet().stream()
+        .mapToInt(
+            entry ->
+                (entry.getValue().getClass().isArray()
+                    ? (entry.getKey() == null ? 0 : entry.getKey().hashCode())
+                        ^ Arrays.hashCode((Object[]) entry.getValue())
+                    : entry.hashCode()))
+        .sum();
+  }
+
+  /** @return a new {@link FieldMetadata.Builder} */
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  /** @return an empty {@link FieldMetadata} instance */
+  public static FieldMetadata empty() {
+    return builder().build();
+  }
+
+  /**
+   * @param key the key to check for
+   * @param type the type to cast the value to
+   * @return the value (casted to the given type) to which the specified key is mapped, or null if
+   *     there is no mapping for the given key
+   */
+  private <T> T get(String key, Class<T> type) {
+    Object value = get(key);
+    if (null == value) {
+      return (T) value;
+    }
+
+    Preconditions.checkArgument(
+        value.getClass().isAssignableFrom(type),
+        "Expected '%s' to be of type '%s' but was '%s'",
+        value,
+        type,
+        value.getClass());
+    return type.cast(value);
+  }
+
+  /** Builder class for {@link FieldMetadata}. */
+  public static class Builder {
+    private Map<String, Object> metadata = new HashMap<String, Object>();
+
+    public Builder putNull(String key) {
+      metadata.put(key, null);
+      return this;
+    }
+
+    public Builder putLong(String key, long value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putDouble(String key, double value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putBoolean(String key, boolean value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putString(String key, String value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putMetadataColumnSpec(String key, MetadataColumnSpec value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putFieldMetadata(String key, FieldMetadata value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putLongArray(String key, Long[] value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putDoubleArray(String key, Double[] value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putBooleanArray(String key, Boolean[] value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putStringArray(String key, String[] value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder putFieldMetadataArray(String key, FieldMetadata[] value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    /**
+     * Adds all metadata from {@code meta.metadata} to the builder's {@code metadata}. Entries in
+     * the builder's {@code metadata} are overwritten with the entries from {@code meta.metadata}.
+     *
+     * @param meta The {@link FieldMetadata} instance holding metadata
+     * @return this
+     */
+    public Builder fromMetadata(FieldMetadata meta) {
+      metadata.putAll(meta.metadata);
+      return this;
+    }
+
+    /** @return a new {@link FieldMetadata} with the mappings added to the builder */
+    public FieldMetadata build() {
+      return new FieldMetadata(this.metadata);
+    }
+
+    public FieldMetadata getMetadata(String key) {
+      Object value = metadata.get(key);
+      if (null == value) {
+        return null;
+      }
+      if (value instanceof FieldMetadata) {
+        return (FieldMetadata) value;
+      }
+      throw new io.delta.kernel.exceptions.KernelException(
+          String.format(
+              "Expected '%s' to be of type 'FieldMetadata' but was '%s'",
+              value, value.getClass().getName()));
+    }
+
+    public Builder remove(String s) {
+      metadata.remove(s);
+      return this;
+    }
+  }
+}

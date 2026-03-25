@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (2021) The Delta Lake Project Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+import os
+import subprocess
+import shutil
+from os import path
+import json
+
+
+def test(root_dir, code_dir, packages):
+    # Test the codes in the code_dir directory using its "tests" subdirectory,
+    # each of them has main entry point to execute, which is python's unittest testing
+    # framework.
+    python_root_dir = path.join(root_dir, "python")
+    test_dir = path.join(python_root_dir, path.join(code_dir, "tests"))
+    test_files = [os.path.join(test_dir, f) for f in os.listdir(test_dir)
+                  if os.path.isfile(os.path.join(test_dir, f)) and
+                  f.endswith(".py") and not f.startswith("_")]
+    extra_class_path = path.join(python_root_dir, path.join(code_dir, "testing"))
+
+    # Include Maven local repository to resolve locally published Delta artifacts
+    maven_local_repo = "file://" + os.path.expanduser("~/.m2/repository")
+
+    for test_file in test_files:
+        try:
+            cmd = ["spark-submit",
+                   "--driver-class-path=%s" % extra_class_path,
+                   "--repositories",
+                   (f"{maven_local_repo},"
+                    "https://maven-central.storage-download.googleapis.com/maven2/,"
+                       "https://repo1.maven.org/maven2/,"
+                       "https://repository.apache.org/content/repositories/orgapachespark-1484"),
+                   "--packages", ",".join(packages), test_file]
+            print("Running tests in %s\n=============" % test_file)
+            print("Command: %s" % str(cmd))
+            run_cmd(cmd, stream_output=True)
+        except:
+            print("Failed tests in %s" % (test_file))
+            raise
+
+
+def delete_if_exists(path):
+    # if path exists, delete it.
+    if os.path.exists(path):
+        shutil.rmtree(path)
+        print("Deleted %s " % path)
+
+
+def prepare(root_dir, spark_version):
+    print("##### Preparing python tests & building packages #####")
+    # Build package with python files in it
+    sbt_path = path.join(root_dir, path.join("build", "sbt"))
+    ivy_caches_to_clear = [
+        filepath for filepath in os.listdir(os.path.expanduser("~"))
+        if filepath.startswith(".ivy")
+    ]
+    print(f"Clearing Ivy caches in: {ivy_caches_to_clear}")
+    for filepath in ivy_caches_to_clear:
+        delete_if_exists(os.path.expanduser(f"~/{filepath}/cache/io.delta"))
+    delete_if_exists(os.path.expanduser("~/.m2/repository/io/delta/"))
+    sbt_command = [sbt_path]
+    sbt_command = sbt_command + [f"-DsparkVersion={spark_version}"]
+    run_cmd(sbt_command + ["clean", "publishM2"], stream_output=True)
+
+
+def get_local_package(package_name, spark_version, root_dir):
+    """Get the Maven coordinates for a Delta package.
+
+    Queries CrossSparkVersions for the packageSuffix (e.g., "", "_4.1").
+
+    Args:
+        package_name: Name of the package (e.g., "delta-spark", "delta-connect-server")
+        spark_version: Spark version string (e.g., "4.0", "4.1", or "default")
+        root_dir: Root directory of the Delta repository
+
+    Returns:
+        Maven coordinates string (e.g., "io.delta:delta-spark_2.13:4.1.0-SNAPSHOT")
+    """
+    # Get current release version
+    version = '0.0.0'
+    with open(os.path.join(root_dir, "version.sbt")) as fd:
+        version = fd.readline().split('"')[1]
+
+    # Get package suffix directly from CrossSparkVersions (single source of truth)
+    script_path = os.path.join(root_dir, "project", "scripts", "get_spark_version_info.py")
+    try:
+        result = subprocess.run(
+            ["python3", script_path, "--get-field", spark_version, "packageSuffix"],
+            cwd=root_dir,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        package_name_suffix = json.loads(result.stdout.strip())
+    except Exception as e:
+        print(f"Warning: Could not determine package suffix for Spark {spark_version}: {e}")
+        print(f"Falling back to empty suffix")
+        package_name_suffix = ""
+
+    return f"io.delta:{package_name}{package_name_suffix}_2.13:" + version
+
+
+def run_cmd(cmd, throw_on_error=True, env=None, stream_output=False, print_cmd=True, **kwargs):
+    if print_cmd:
+        print("### Executing cmd: " + " ".join(cmd))
+
+    cmd_env = os.environ.copy()
+    if env:
+        cmd_env.update(env)
+
+    if stream_output:
+        child = subprocess.Popen(cmd, env=cmd_env, **kwargs)
+        exit_code = child.wait()
+        if throw_on_error and exit_code != 0:
+            raise Exception("Non-zero exitcode: %s" % (exit_code))
+        return exit_code
+    else:
+        child = subprocess.Popen(
+            cmd,
+            env=cmd_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs)
+        (stdout, stderr) = child.communicate()
+        exit_code = child.wait()
+        if throw_on_error and exit_code != 0:
+            raise Exception(
+                "Non-zero exitcode: %s\n\nSTDOUT:\n%s\n\nSTDERR:%s" %
+                (exit_code, stdout, stderr))
+        return (exit_code, stdout, stderr)
+
+
+def run_python_style_checks(root_dir):
+    print("##### Running python style tests #####")
+    run_cmd([os.path.join(root_dir, "dev", "lint-python")], stream_output=True)
+
+
+def run_mypy_tests(root_dir):
+    print("##### Running mypy tests #####")
+    python_package_root = path.join(root_dir, path.join("python", "delta"))
+    mypy_config_path = path.join(root_dir, path.join("python", "mypy.ini"))
+    run_cmd([
+        "mypy",
+        "--config-file", mypy_config_path,
+        python_package_root
+    ], stream_output=True)
+
+
+def run_pypi_packaging_tests(root_dir):
+    """
+    We want to test that the delta-spark PyPi artifact for this delta version can be generated,
+    locally installed, and used in python tests.
+
+    We will uninstall any existing local delta-spark PyPi artifact.
+    We will generate a new local delta-spark PyPi artifact.
+    We will install it into the local PyPi repository.
+    And then we will run relevant python tests to ensure everything works as expected.
+    """
+    print("##### Running PyPi Packaging tests #####")
+
+    version = '0.0.0'
+    with open(os.path.join(root_dir, "version.sbt")) as fd:
+        version = fd.readline().split('"')[1]
+
+    # uninstall packages if they exist
+    run_cmd(["pip3", "uninstall", "--yes", "delta-spark"], stream_output=True)
+
+    wheel_dist_dir = path.join(root_dir, "dist")
+
+    print("### Deleting `dist` directory if it exists")
+    delete_if_exists(wheel_dist_dir)
+
+    # generate artifacts
+    run_cmd(
+        ["python3", "setup.py", "bdist_wheel"],
+        stream_output=True,
+        stderr=open('/dev/null', 'w'))
+
+    run_cmd(["python3", "setup.py", "sdist"], stream_output=True)
+
+    # we need, for example, 1.1.0_SNAPSHOT not 1.1.0-SNAPSHOT
+    version_formatted = version.replace("-", "_")
+    delta_whl_name = "delta_spark-" + version_formatted + "-py3-none-any.whl"
+
+    # this will install delta-spark-$version
+    install_whl_cmd = ["pip3", "install", path.join(wheel_dist_dir, delta_whl_name)]
+    run_cmd(install_whl_cmd, stream_output=True)
+
+    # run test python file directly with python and not with spark-submit
+    test_file = path.join(root_dir, path.join("examples", "python", "using_with_pip.py"))
+    test_cmd = ["python3", test_file]
+    try:
+        print("### Starting tests...")
+        run_cmd(test_cmd, stream_output=True)
+    except:
+        print("Failed pip installation tests in %s" % (test_file))
+        raise
+
+
+def run_delta_connect_codegen_python(root_dir):
+    print("##### Running generated Delta Connect Python protobuf codes syncing tests #####")
+    test_file = os.path.join(root_dir, "dev", "check-delta-connect-codegen-python.py")
+    test_cmd = ["python3", test_file]
+    run_cmd(test_cmd, stream_output=True)
+
+
+if __name__ == "__main__":
+    print("##### Running python tests #####")
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spark_version = os.getenv("SPARK_VERSION") or "default"
+    prepare(root_dir, spark_version)
+    delta_spark_package = get_local_package("delta-spark", spark_version, root_dir)
+
+    run_python_style_checks(root_dir)
+    run_mypy_tests(root_dir)
+    run_pypi_packaging_tests(root_dir)
+    test(root_dir, "delta", [delta_spark_package])
+
+    # Run Delta Connect tests as well
+    run_delta_connect_codegen_python(root_dir)
+    # TODO: In the future, find a way to get these
+    # packages locally instead of downloading from Maven.
+    # Get the full Spark version for spark-connect artifact
+    script_path = os.path.join(root_dir, "project", "scripts", "get_spark_version_info.py")
+    result = subprocess.run(
+        ["python3", script_path, "--get-field", spark_version, "fullVersion"],
+        cwd=root_dir,
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    spark_full_version = json.loads(result.stdout.strip())
+
+    delta_connect_packages = ["com.google.protobuf:protobuf-java:3.25.1",
+                              f"org.apache.spark:spark-connect_2.13:{spark_full_version}",
+                              get_local_package("delta-connect-server", spark_version, root_dir)]
+
+    test(root_dir, path.join("delta", "connect"), delta_connect_packages)
