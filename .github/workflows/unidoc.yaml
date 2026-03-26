@@ -4,9 +4,11 @@
       branches: [master]
     pull_request:
       branches: [master]
+      types: [opened, synchronize, reopened, edited]
   jobs:
     build:
       name: "U: Scala ${{ matrix.scala }}"
+      if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base
       runs-on: ubuntu-24.04
       strategy:
         matrix:

@@ -7,6 +7,7 @@ on:
       - '**.txt'
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, edited]
     paths-ignore:
       - '**.md'
       - '**.txt'
@@ -15,6 +16,7 @@ jobs:
   # This workflow tests against released versions only (no snapshots)
   generate-matrix:
     name: "Generate Released Spark Versions Matrix"
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     outputs:
       spark_versions: ${{ steps.generate.outputs.spark_versions }}

@@ -8,6 +8,7 @@ on:
       - '**.txt'
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, edited]
     paths-ignore:
       - '**.md'
       - '**.txt'
@@ -24,6 +25,7 @@ env:
 jobs:
   test:
     name: "DK: Shard ${{ matrix.shard }}"
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false # Allow all shards to run even if one fails
@@ -76,6 +78,7 @@ jobs:
 
   integration-test:
     name: "DK: Integration"
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
