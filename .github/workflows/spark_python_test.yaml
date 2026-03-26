@@ -79,15 +79,33 @@ jobs:
           # cache new stuff.
           key: delta-sbt-cache-spark${{ matrix.spark_version }}-scala${{ matrix.scala }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        run: |
+          # uv 0.10.1 (2026-02-10) — SHA from official release asset:
+          # https://github.com/astral-sh/uv/releases/download/0.10.1/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
+          UV_VERSION="0.10.1"
+          UV_SHA256="8b5af2d678da1bdae80a5107c934f6ab010c6cdeb2de5b8e07568031d9486051"
+          curl -fsSL -o uv-x86_64-unknown-linux-gnu.tar.gz \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${UV_SHA256}  uv-x86_64-unknown-linux-gnu.tar.gz" | sha256sum -c -
+          tar -xzf uv-x86_64-unknown-linux-gnu.tar.gz
+          install -m 755 uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv
+          install -m 755 uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx
+          rm -rf uv-x86_64-unknown-linux-gnu uv-x86_64-unknown-linux-gnu.tar.gz
+          uv --version
       - name: Install Job dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y make build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev python3-openssl git
           sudo apt install libedit-dev
-          curl -LO https://github.com/bufbuild/buf/releases/download/v1.28.1/buf-Linux-x86_64.tar.gz
+          # buf v1.28.1 (2023-11-15) — SHA from official release asset:
+          # https://github.com/bufbuild/buf/releases/download/v1.28.1/sha256.txt
+          BUF_VERSION="v1.28.1"
+          BUF_SHA256="870cf492d381a967d36636fdee9da44b524ea62aad163659b8dbf16a7da56987"
+          curl -fsSL -o buf-Linux-x86_64.tar.gz \
+            "https://github.com/bufbuild/buf/releases/download/${BUF_VERSION}/buf-Linux-x86_64.tar.gz"
+          echo "${BUF_SHA256}  buf-Linux-x86_64.tar.gz" | sha256sum -c -
           mkdir -p ~/buf
-          tar -xvzf buf-Linux-x86_64.tar.gz -C ~/buf --strip-components 1
+          tar -xzf buf-Linux-x86_64.tar.gz -C ~/buf --strip-components 1
           rm buf-Linux-x86_64.tar.gz
           uv python install 3.10
           uv venv .venv --python 3.10
