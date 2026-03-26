@@ -4,6 +4,7 @@
 # To regenerate the lock file:
 #   UV_EXCLUDE_NEWER="2026-03-10T00:00:00Z" uv pip compile \
 #     --python-version 3.10 \
+#     --python-platform linux \
 #     --generate-hashes \
 #     -o spark4.0.lock \
 #     spark4.0.in
