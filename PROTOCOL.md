@@ -1013,7 +1013,7 @@ Field Name | Data Type | Description
 -|-|-
 storageType | String | A single character to indicate how to access the DV. Legal options are: `['u', 'i', 'p']`.
 pathOrInlineDv | String | Three format options are currently proposed:<ul><li>If `storageType = 'u'` then  `<random prefix - optional><base85 encoded uuid>`: The deletion vector is stored in a file with a path relative to the data directory of this Delta table, and the  file name can be reconstructed from the UUID. See Derived Fields for how to reconstruct the file name. The random prefix is recovered as the extra characters before the (20 characters fixed length) uuid.</li><li>If `storageType = 'i'` then `<base85 encoded bytes>`: The deletion vector is stored inline in the log. The format used is the `RoaringBitmapArray` format also used when the DV is stored on disk and described in [Deletion Vector Format](#Deletion-Vector-Format).</li><li>If `storageType = 'p'` then `<absolute path>`: The DV is stored in a file with an absolute path given by this path, which has the same format as the `path` field in the `add`/`remove` actions.</li></ul>
-offset | Option[Int] | Start of the data for this DV in number of bytes from the beginning of the file it is stored in. Always `None` (absent in JSON) when `storageType = 'i'`.
+offset | Option[Int] | Start of the data for this DV in number of bytes from the beginning of the file it is stored in. Always `None` (absent in JSON) when `storageType = 'i'`. Interpret as `0` if absent for other `storageType`s.
 sizeInBytes | Int | Size of the serialized DV in bytes (raw data size, i.e. before base85 encoding, if inline).
 cardinality | Long | Number of rows the given DV logically removes from the file.
 
@@ -2433,6 +2433,14 @@ The requirements of the readers according to the protocol versions are summarize
 -|-
 Reader Version 2 | Respect [Column Mapping](#column-mapping)
 Reader Version 3 | Respect [Table Features](#table-features) for readers<br> - Writer Version must be 7
+
+# Table Properties
+
+Delta Lake tables support a set of properties stored in the `configuration` field of the `metaData` action that control various aspects of table behavior.
+
+Property | Description | Details
+-|-|-
+`delta.parquet.compression.codec` | Compression codec writers SHOULD use for new Parquet data and checkpoint files. Changing this property does not affect existing files; a table may contain files written with different codecs, which is a normal and expected state. | Widely supported values (matched case-insensitively): `uncompressed`/`none` (no compression), `snappy`, `gzip`, `lz4` (deprecated, Hadoop framing), `lz4_raw` ([LZ4 block format](https://parquet.apache.org/docs/file-format/data-pages/compression/#lz4_raw)), `zstd`.<br><br>When absent, writers SHOULD default to `zstd`. If a writer does not support or recognize the specified codec, it SHOULD abort with an appropriate error or fall back to a default codec.<br><br>Readers SHOULD support all codecs listed above regardless of the current property value. Parquet files written with other [parquet-supported codecs](https://parquet.apache.org/docs/file-format/data-pages/compression/) may also exist; readers MAY support reading these files.
 
 # Appendix
 
